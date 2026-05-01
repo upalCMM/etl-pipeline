@@ -1,0 +1,1 @@
+bq_transfer_env\Scripts\Activate.ps1

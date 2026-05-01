@@ -1,0 +1,346 @@
+import requests
+import psycopg2
+import pandas as pd
+import os
+import json
+from datetime import datetime
+import logging
+from dotenv import load_dotenv
+import certifi
+
+# Load environment variables
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def get_mailchimp_data_direct():
+    """
+    Fetch Mailchimp reports directly from API
+    """
+    # Mailchimp API configuration
+    api_key = os.getenv('MAILCHIMP_API_KEY')
+    data_center = os.getenv('MAILCHIMP_DATA_CENTER', 'us11')
+    
+    if not api_key:
+        logger.error("MAILCHIMP_API_KEY not found in environment variables")
+        return None
+    
+    # From August 1st, 2025 date range
+    since_date = "2025-08-01T00:00:00Z"
+    
+    # API endpoint
+    url = f"https://{data_center}.api.mailchimp.com/3.0/reports"
+    headers = {
+        'Authorization': f'apikey {api_key}'
+    }
+    
+    params = {
+        'since_send_time': since_date,
+        'count': '1000',
+        'sort_field': 'send_time',
+        'sort_dir': 'DESC'
+    }
+    
+    try:
+        logger.info(f"Fetching Mailchimp data directly from API...")
+        logger.info(f"Date range: {since_date} to present")
+        
+        # Use certifi for SSL certificates
+        response = requests.get(url, headers=headers, params=params, verify=certifi.where())
+        response.raise_for_status()
+        
+        data = response.json()
+        reports = data.get('reports', [])
+        
+        logger.info(f"Found {len(reports)} reports since August 1st, 2025")
+        
+        if not reports:
+            logger.warning("No reports found for the specified date range")
+            return []
+        
+        # Process the data - following your M query structure
+        processed_data = []
+        for report in reports:
+            # Extract nested data like in your M query
+            opens_data = report.get('opens', {})
+            bounces_data = report.get('bounces', {})
+            clicks_data = report.get('clicks', {})
+            
+            row = {
+                'id': report.get('id', ''),
+                'campaign_title': report.get('campaign_title', ''),
+                'list_name': report.get('list_name', ''),
+                'subject_line': report.get('subject_line', ''),
+                'emails_sent': report.get('emails_sent', 0),
+                'unsubscribed': report.get('unsubscribed', 0),
+                'send_time': report.get('send_time', ''),
+                # Bounces (expanded from nested object)
+                'hard_bounces': bounces_data.get('hard_bounces', 0),
+                'soft_bounces': bounces_data.get('soft_bounces', 0),
+                # Opens (expanded from nested object)
+                'opens_total': opens_data.get('opens_total', 0),
+                'unique_opens': opens_data.get('unique_opens', 0),
+                'open_rate': opens_data.get('open_rate', 0),
+                # MPP fields from opens
+                'proxy_excluded_opens': opens_data.get('proxy_excluded_opens', 0),
+                'proxy_excluded_unique_opens': opens_data.get('proxy_excluded_unique_opens', 0),
+                'proxy_excluded_open_rate': opens_data.get('proxy_excluded_open_rate', 0),
+                # Clicks (expanded from nested object)
+                'clicks_total': clicks_data.get('clicks_total', 0),
+                'unique_clicks': clicks_data.get('unique_clicks', 0),
+                'click_rate': clicks_data.get('click_rate', 0),
+                # Links
+                '_links': report.get('_links', {})
+            }
+            processed_data.append(row)
+        
+        logger.info(f"Successfully processed {len(processed_data)} reports")
+        return processed_data
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching data from Mailchimp API: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logger.error(f"Response status: {e.response.status_code}")
+            logger.error(f"Response body: {e.response.text}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return None
+
+def ensure_mailchimp_table(cursor):
+    """Ensure the fact_mailchimp table exists with all required columns"""
+    
+    # First, check if table exists and has the new columns
+    check_columns_query = """
+    SELECT column_name 
+    FROM information_schema.columns 
+    WHERE table_schema = 'pipedrive' 
+    AND table_name = 'fact_mailchimp'
+    AND column_name IN ('proxy_excluded_opens', 'proxy_excluded_unique_opens', 'proxy_excluded_open_rate', '_links');
+    """
+    
+    cursor.execute(check_columns_query)
+    existing_columns = [row[0] for row in cursor.fetchall()]
+    
+    missing_columns = []
+    required_columns = ['proxy_excluded_opens', 'proxy_excluded_unique_opens', 'proxy_excluded_open_rate', '_links']
+    
+    for col in required_columns:
+        if col not in existing_columns:
+            missing_columns.append(col)
+    
+    # Add missing columns if any
+    if missing_columns:
+        for column in missing_columns:
+            if column == '_links':
+                alter_query = "ALTER TABLE pipedrive.fact_mailchimp ADD COLUMN _links JSONB;"
+            elif column == 'proxy_excluded_open_rate':
+                alter_query = "ALTER TABLE pipedrive.fact_mailchimp ADD COLUMN proxy_excluded_open_rate DECIMAL(5,4);"
+            else:
+                alter_query = f"ALTER TABLE pipedrive.fact_mailchimp ADD COLUMN {column} INTEGER DEFAULT 0;"
+            
+            try:
+                cursor.execute(alter_query)
+                logger.info(f"Added missing column: {column}")
+            except Exception as e:
+                logger.error(f"Error adding column {column}: {e}")
+                return False
+    
+    # If table doesn't exist at all, create it
+    create_table_query = """
+    CREATE TABLE IF NOT EXISTS pipedrive.fact_mailchimp (
+        id VARCHAR(50) PRIMARY KEY,
+        campaign_title TEXT,
+        list_name TEXT,
+        subject_line TEXT,
+        emails_sent INTEGER,
+        unsubscribed INTEGER,
+        send_time TIMESTAMP,
+        hard_bounces INTEGER DEFAULT 0,
+        soft_bounces INTEGER DEFAULT 0,
+        opens_total INTEGER DEFAULT 0,
+        unique_opens INTEGER DEFAULT 0,
+        open_rate DECIMAL(5,4),
+        clicks_total INTEGER DEFAULT 0,
+        unique_clicks INTEGER DEFAULT 0,
+        click_rate DECIMAL(5,4),
+        -- New fields
+        proxy_excluded_opens INTEGER DEFAULT 0,
+        proxy_excluded_unique_opens INTEGER DEFAULT 0,
+        proxy_excluded_open_rate DECIMAL(5,4),
+        _links JSONB,
+        sync_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT valid_open_rate CHECK (open_rate >= 0 AND open_rate <= 1),
+        CONSTRAINT valid_click_rate CHECK (click_rate >= 0 AND click_rate <= 1),
+        CONSTRAINT valid_proxy_open_rate CHECK (proxy_excluded_open_rate >= 0 AND proxy_excluded_open_rate <= 1)
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_fact_mailchimp_send_time ON pipedrive.fact_mailchimp(send_time);
+    CREATE INDEX IF NOT EXISTS idx_fact_mailchimp_list_name ON pipedrive.fact_mailchimp(list_name);
+    """
+    
+    try:
+        cursor.execute(create_table_query)
+        logger.info("Table pipedrive.fact_mailchimp ensured with all columns")
+        return True
+    except Exception as e:
+        logger.error(f"Error ensuring table: {e}")
+        return False
+
+def load_data_to_postgres(reports_data):
+    """Load data directly into PostgreSQL fact_mailchimp table"""
+    
+    # Database configuration
+    db_config = {
+        'host': os.getenv('PG_HOST'),
+        'database': os.getenv('PG_NAME'),
+        'user': os.getenv('PG_USER'),
+        'password': os.getenv('PG_PASS'),
+        'port': os.getenv('PG_PORT', '5432')
+    }
+    
+    try:
+        if not reports_data:
+            logger.warning("No data to load into PostgreSQL")
+            return True
+        
+        # Connect to PostgreSQL
+        logger.info("Connecting to PostgreSQL...")
+        conn = psycopg2.connect(**db_config)
+        cur = conn.cursor()
+        logger.info("Successfully connected to PostgreSQL")
+        
+        # Ensure table has all required columns
+        if not ensure_mailchimp_table(cur):
+            return False
+        
+        # Insert data
+        insert_query = """
+        INSERT INTO pipedrive.fact_mailchimp 
+        (id, campaign_title, list_name, subject_line, emails_sent, unsubscribed, 
+         send_time, hard_bounces, soft_bounces, opens_total, unique_opens, open_rate,
+         clicks_total, unique_clicks, click_rate, proxy_excluded_opens, 
+         proxy_excluded_unique_opens, proxy_excluded_open_rate, _links)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            campaign_title = EXCLUDED.campaign_title,
+            list_name = EXCLUDED.list_name,
+            subject_line = EXCLUDED.subject_line,
+            emails_sent = EXCLUDED.emails_sent,
+            unsubscribed = EXCLUDED.unsubscribed,
+            send_time = EXCLUDED.send_time,
+            hard_bounces = EXCLUDED.hard_bounces,
+            soft_bounces = EXCLUDED.soft_bounces,
+            opens_total = EXCLUDED.opens_total,
+            unique_opens = EXCLUDED.unique_opens,
+            open_rate = EXCLUDED.open_rate,
+            clicks_total = EXCLUDED.clicks_total,
+            unique_clicks = EXCLUDED.unique_clicks,
+            click_rate = EXCLUDED.click_rate,
+            proxy_excluded_opens = EXCLUDED.proxy_excluded_opens,
+            proxy_excluded_unique_opens = EXCLUDED.proxy_excluded_unique_opens,
+            proxy_excluded_open_rate = EXCLUDED.proxy_excluded_open_rate,
+            _links = EXCLUDED._links,
+            sync_timestamp = CURRENT_TIMESTAMP;
+        """
+        
+        # Prepare data for insertion
+        data_tuples = []
+        for report in reports_data:
+            # Convert send_time to timestamp without timezone
+            send_time = pd.to_datetime(report['send_time']).tz_localize(None) if report['send_time'] else None
+            
+            data_tuples.append((
+                report['id'],
+                report['campaign_title'],
+                report['list_name'],
+                report['subject_line'],
+                report['emails_sent'],
+                report['unsubscribed'],
+                send_time,
+                report['hard_bounces'],
+                report['soft_bounces'],
+                report['opens_total'],
+                report['unique_opens'],
+                report['open_rate'],
+                report['clicks_total'],
+                report['unique_clicks'],
+                report['click_rate'],
+                report['proxy_excluded_opens'],
+                report['proxy_excluded_unique_opens'],
+                report['proxy_excluded_open_rate'],
+                json.dumps(report['_links'])
+            ))
+        
+        # Execute batch insert
+        cur.executemany(insert_query, data_tuples)
+        conn.commit()
+        
+        logger.info(f"Successfully loaded {len(data_tuples)} records into pipedrive.fact_mailchimp")
+        
+        # Verify the data
+        cur.execute("SELECT COUNT(*) FROM pipedrive.fact_mailchimp")
+        count = cur.fetchone()[0]
+        logger.info(f"Total records in pipedrive.fact_mailchimp: {count}")
+        
+        # Show sample of data with new fields
+        cur.execute("""
+            SELECT id, campaign_title, send_time, emails_sent, 
+                   unique_opens, proxy_excluded_unique_opens, 
+                   unique_clicks, proxy_excluded_open_rate
+            FROM pipedrive.fact_mailchimp 
+            ORDER BY send_time DESC 
+            LIMIT 5
+        """)
+        latest_records = cur.fetchall()
+        
+        print("\n" + "="*80)
+        print("LATEST 5 RECORDS IN pipedrive.fact_mailchimp")
+        print("="*80)
+        for record in latest_records:
+            print(f"ID: {record[0]}")
+            print(f"Campaign: {record[1]}")
+            print(f"Sent: {record[2]} | Emails: {record[3]}")
+            print(f"Unique Opens: {record[4]} | Proxy Excluded Unique Opens: {record[5]}")
+            print(f"Unique Clicks: {record[6]} | Proxy Excluded Open Rate: {record[7]:.4f}")
+            print("-" * 80)
+        
+        cur.close()
+        conn.close()
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error loading data to PostgreSQL: {e}")
+        return False
+
+if __name__ == "__main__":
+    print("Direct Mailchimp to PostgreSQL Sync")
+    print("=" * 50)
+    print("INCLUDING: proxy_excluded_opens, proxy_excluded_unique_opens,")
+    print("proxy_excluded_open_rate, _links")
+    print("Date Range: August 1st, 2025 to present")
+    print("Table: pipedrive.fact_mailchimp")
+    print("=" * 50)
+    
+    # Step 1: Get data directly from Mailchimp API
+    reports_data = get_mailchimp_data_direct()
+    
+    if reports_data is None:
+        print("\n❌ Failed to fetch data from Mailchimp API")
+        exit(1)
+    
+    if not reports_data:
+        print("\n⚠️  No data found for the specified date range")
+        exit(0)
+    
+    # Step 2: Load directly into PostgreSQL
+    success = load_data_to_postgres(reports_data)
+    
+    if success:
+        print(f"\n✅ Successfully synced {len(reports_data)} records directly to pipedrive.fact_mailchimp!")
+        print("📊 All fields included: proxy_excluded_opens, proxy_excluded_unique_opens,")
+        print("   proxy_excluded_open_rate, _links")
+    else:
+        print("\n❌ Failed to load data into PostgreSQL")

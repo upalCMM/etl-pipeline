@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""
+Google Ads ETL Script - WSL Compatible Version
+"""
+import os
+import sys
+import certifi
+import pandas as pd
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, Tuple
+from dataclasses import dataclass
+from contextlib import contextmanager
+from google.cloud import bigquery
+from google.cloud.exceptions import GoogleCloudError
+from sqlalchemy import create_engine, text, exc
+from sqlalchemy.engine import Engine
+from dotenv import load_dotenv
+
+# ============================================
+# WSL-SPECIFIC FIXES
+# ============================================
+
+# Set SSL certificates for WSL
+os.environ['SSL_CERT_FILE'] = certifi.where()
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+
+# Load environment variables from .env file in current directory
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+if os.path.exists(env_path):
+    load_dotenv(env_path)
+    print(f"✅ Loaded .env from: {env_path}")
+else:
+    print(f"⚠️ .env not found at: {env_path}, loading from current directory")
+    load_dotenv()
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('google_ads_fixed_etl.log', encoding='utf-8', mode='a'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# CONFIGURATION
+# ============================================
+
+# Get configuration from environment variables
+SCHEMA_NAME = 'google_data'
+TABLE_NAME = 'google_ads_daily'
+FIXED_START_DATE = '2025-01-01'  # Always start from Jan 1, 2025
+CHUNK_SIZE = 10000
+
+# BigQuery Configuration from .env file
+BIGQUERY_CONFIG = {
+    'project': os.getenv('BIGQUERY_PROJECT', 'iron-circuit-345510'),
+    'credentials_path': os.getenv('BIGQUERY_CREDENTIALS_PATH', 'service-account-key.json'),
+    'dataset': os.getenv('BIGQUERY_DATASET', 'google_ads_mcc')
+}
+
+# Database Configuration from .env file
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', '192.168.1.250'),
+    'port': os.getenv('DB_PORT', '5432'),
+    'database': os.getenv('DB_NAME', 'pipedrive'),
+    'user': os.getenv('DB_USER', 'postgres'),
+    'password': os.getenv('DB_PASSWORD', '')
+}
+
+def fix_wsl_path(path: str) -> str:
+    """Convert Windows paths to WSL paths if needed"""
+    if '\\' in path or ('C:' in path and '/mnt/c' not in path):
+        fixed = path.replace('\\', '/').replace('C:', '/mnt/c')
+        logger.info(f"Converted path for WSL: {path} -> {fixed}")
+        return fixed
+    return path
+
+# Fix credentials path for WSL
+BIGQUERY_CONFIG['credentials_path'] = fix_wsl_path(BIGQUERY_CONFIG['credentials_path'])
+
+@dataclass
+class ETLStats:
+    """Statistics for ETL process"""
+    rows_extracted: int = 0
+    rows_transformed: int = 0
+    rows_upserted: int = 0
+    date_range: Tuple[str, str] = None
+    execution_time: float = 0.0
+    error_count: int = 0
+
+class GoogleAdsFixedETL:
+    def __init__(self, start_date: Optional[str] = None, end_date: Optional[str] = None):
+        """
+        Initialize ETL with fixed campaign status handling
+        
+        Args:
+            start_date: Start date (default: 2025-01-01)
+            end_date: End date (default: yesterday)
+        """
+        self.bq_client: Optional[bigquery.Client] = None
+        self.pg_engine: Optional[Engine] = None
+        
+        # Always start from January 1, 2025 unless specified
+        self.start_date = start_date or FIXED_START_DATE
+        
+        # Default end date is yesterday
+        if not end_date:
+            end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        
+        # Validate end date is not before start date
+        if end_date < self.start_date:
+            logger.warning(f"End date {end_date} is before start date {self.start_date}")
+            end_date = self.start_date
+        
+        self.end_date = end_date
+        self.stats = ETLStats()
+        self.stats.date_range = (self.start_date, self.end_date)
+        
+        self.setup_clients()
+        logger.info(f"✅ ETL initialized with date range: {self.start_date} to {self.end_date}")
+        logger.info("⚠ IMPORTANT: Using FIXED query that includes ALL campaign statuses (ENABLED, PAUSED, REMOVED)")
+    
+    def setup_clients(self):
+        """Initialize BigQuery and PostgreSQL clients"""
+        try:
+            logger.info("Initializing BigQuery client...")
+            
+            # Check credentials file
+            creds_path = BIGQUERY_CONFIG['credentials_path']
+            if not os.path.exists(creds_path):
+                raise FileNotFoundError(f"Credentials file not found: {creds_path}")
+            
+            logger.info(f"Using credentials from: {creds_path}")
+            
+            self.bq_client = bigquery.Client.from_service_account_json(
+                creds_path,
+                project=BIGQUERY_CONFIG['project']
+            )
+            logger.info("✅ BigQuery client connected")
+            
+            # PostgreSQL engine
+            postgres_url = (
+                f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
+                f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+            )
+            self.pg_engine = create_engine(
+                postgres_url,
+                pool_size=10,
+                max_overflow=20,
+                pool_pre_ping=True,
+                connect_args={'connect_timeout': 30}
+            )
+            logger.info("✅ PostgreSQL engine created")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize clients: {e}")
+            raise
+    
+    def extract_from_bigquery(self) -> pd.DataFrame:
+        """EXTRACT: Get data from BigQuery - FIXED campaign status handling"""
+        start_time = datetime.now()
+        try:
+            logger.info(f"📥 EXTRACT: Fetching Google Ads data from {self.start_date} to {self.end_date}...")
+            
+            # Build table names
+            project = BIGQUERY_CONFIG['project']
+            dataset = BIGQUERY_CONFIG['dataset']
+            campaign_table = f"{project}.{dataset}.ads_Campaign_2206191174"
+            stats_table = f"{project}.{dataset}.ads_CampaignBasicStats_2206191174"
+            
+            # ============================================================
+            # FIXED QUERY - Includes all campaign statuses
+            # ============================================================
+            query = f"""
+            -- Get LATEST campaign metadata (including ALL statuses)
+            WITH latest_campaign_metadata AS (
+              SELECT
+                campaign_id,
+                campaign_advertising_channel_type,
+                campaign_name,
+                -- Clean campaign name
+                TRIM(REGEXP_REPLACE(
+                  REPLACE(REPLACE(campaign_name, '—', '-'), '–', '-'),
+                  r'\\s+', ' '
+                )) AS clean_name,
+                ROW_NUMBER() OVER (
+                  PARTITION BY campaign_id 
+                  ORDER BY _DATA_DATE DESC
+                ) AS meta_rn
+              FROM `{campaign_table}`
+              -- FIXED: Include ALL campaigns regardless of status
+              -- This fixes the "Unknown" campaign name issue
+              WHERE campaign_name IS NOT NULL
+            ),
+            campaign_metadata AS (
+              SELECT
+                campaign_id,
+                campaign_advertising_channel_type,
+                clean_name AS original_campaign_name
+              FROM latest_campaign_metadata
+              WHERE meta_rn = 1  -- Latest metadata only
+            ),
+            -- Get daily stats
+            daily_campaign_stats AS (
+              SELECT
+                campaign_id,
+                DATE(_DATA_DATE) AS date,
+                SUM(metrics_impressions) AS total_impressions,
+                SUM(metrics_clicks) AS total_clicks,
+                SAFE_DIVIDE(SUM(metrics_cost_micros), 1e6) AS total_cost,
+                SUM(metrics_conversions) AS total_conversions,
+                SUM(metrics_conversions_value) AS total_revenue
+              FROM `{stats_table}`
+              WHERE DATE(_DATA_DATE) >= DATE '{self.start_date}'
+                AND DATE(_DATA_DATE) <= DATE '{self.end_date}'
+              GROUP BY campaign_id, DATE(_DATA_DATE)
+            ),
+            -- Join and aggregate
+            final_data AS (
+              SELECT
+                dcs.date,
+                COALESCE(cm.original_campaign_name, 'Unknown Campaign') AS original_name,
+                COALESCE(cm.campaign_advertising_channel_type, 'UNSPECIFIED') AS campaign_channel_type,
+                -- Parse campaign name components
+                CASE
+                  WHEN STRPOS(COALESCE(cm.original_campaign_name, ''), ' - ') > 0
+                    THEN TRIM(SPLIT(COALESCE(cm.original_campaign_name, ''), ' - ')[OFFSET(0)])
+                  ELSE COALESCE(cm.original_campaign_name, 'Unknown')
+                END AS service,
+                CASE
+                  WHEN STRPOS(COALESCE(cm.original_campaign_name, ''), ' - ') > 0
+                    AND (LENGTH(COALESCE(cm.original_campaign_name, '')) - 
+                         LENGTH(REPLACE(COALESCE(cm.original_campaign_name, ''), ' - ', ''))) / 3 >= 1
+                    THEN TRIM(SPLIT(COALESCE(cm.original_campaign_name, ''), ' - ')[OFFSET(1)])
+                  ELSE NULL
+                END AS city,
+                CASE
+                  WHEN STRPOS(COALESCE(cm.original_campaign_name, ''), ' - ') > 0
+                    AND (LENGTH(COALESCE(cm.original_campaign_name, '')) - 
+                         LENGTH(REPLACE(COALESCE(cm.original_campaign_name, ''), ' - ', ''))) / 3 >= 2
+                    THEN TRIM(SPLIT(COALESCE(cm.original_campaign_name, ''), ' - ')[OFFSET(2)])
+                  ELSE NULL
+                END AS campaign_type,
+                SUM(dcs.total_impressions) AS impressions,
+                SUM(dcs.total_clicks) AS clicks,
+                SUM(dcs.total_cost) AS cost,
+                SUM(dcs.total_conversions) AS conversions,
+                SUM(dcs.total_revenue) AS revenue,
+                COUNT(DISTINCT dcs.campaign_id) AS campaign_count
+              FROM daily_campaign_stats dcs
+              LEFT JOIN campaign_metadata cm
+                ON dcs.campaign_id = cm.campaign_id
+              WHERE dcs.total_impressions > 0
+              GROUP BY 
+                dcs.date,
+                cm.original_campaign_name,
+                cm.campaign_advertising_channel_type
+            )
+            
+            SELECT *
+            FROM final_data
+            WHERE impressions > 0
+            ORDER BY date DESC, cost DESC
+            """
+            
+            logger.info(f"Executing BigQuery query for date range: {self.start_date} to {self.end_date}")
+            logger.info(f"Campaign table: {campaign_table}")
+            logger.info(f"Stats table: {stats_table}")
+            
+            # Execute query
+            job_config = bigquery.QueryJobConfig()
+            query_job = self.bq_client.query(query, job_config=job_config)
+            
+            logger.info("🚀 BigQuery query executing...")
+            df = query_job.to_dataframe()
+            
+            self.stats.rows_extracted = len(df)
+            elapsed_time = (datetime.now() - start_time).total_seconds()
+            
+            logger.info(f"✅ EXTRACT completed in {elapsed_time:.1f}s")
+            logger.info(f"   Rows extracted: {self.stats.rows_extracted:,}")
+            
+            if not df.empty:
+                # Analyze results
+                unknown_count = df[df['original_name'] == 'Unknown Campaign'].shape[0]
+                total_impressions = df['impressions'].sum()
+                total_cost = df['cost'].sum()
+                
+                logger.info("\n📊 EXTRACT ANALYSIS:")
+                logger.info(f"   Date range in data: {df['date'].min()} to {df['date'].max()}")
+                logger.info(f"   Total impressions: {total_impressions:,}")
+                logger.info(f"   Total cost: £{total_cost:,.2f}")
+                logger.info(f"   Unique campaigns: {df['campaign_count'].sum():,}")
+                
+                if unknown_count > 0:
+                    logger.warning(f"⚠ Still have {unknown_count} rows with 'Unknown Campaign'")
+                    logger.warning("   These campaigns might have NULL campaign_name in metadata")
+                else:
+                    logger.info("✅ All campaigns have proper names!")
+                
+                # Show sample of parsed data
+                logger.info(f"\n🎯 Sample of parsed campaign names:")
+                sample = df.head(3)
+                for _, row in sample.iterrows():
+                    logger.info(f"   {row['original_name']}")
+                    logger.info(f"     → Service: {row['service']}, City: {row['city']}, Type: {row['campaign_type']}")
+            else:
+                logger.warning("⚠ No data extracted - query returned empty results")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"❌ EXTRACT failed: {e}")
+            raise
+    
+    def transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """TRANSFORM: Clean and prepare data"""
+        if df.empty:
+            logger.warning("No data to transform")
+            return df
+        
+        start_time = datetime.now()
+        logger.info("🔄 TRANSFORM: Processing data...")
+        
+        try:
+            df_transformed = df.copy()
+            
+            # Convert date
+            df_transformed['date'] = pd.to_datetime(df_transformed['date'])
+            
+            # Clean text columns
+            text_columns = ['service', 'city', 'campaign_type', 'campaign_channel_type', 'original_name']
+            for col in text_columns:
+                if col in df_transformed.columns:
+                    df_transformed[col] = df_transformed[col].astype(str).str.strip()
+                    df_transformed[col] = df_transformed[col].replace('nan', None)
+                    df_transformed[col] = df_transformed[col].replace('None', None)
+                    df_transformed[col] = df_transformed[col].replace('', None)
+            
+            # Fill required columns
+            df_transformed['service'] = df_transformed['service'].fillna('Unknown')
+            df_transformed['campaign_channel_type'] = df_transformed['campaign_channel_type'].fillna('UNSPECIFIED')
+            df_transformed['original_name'] = df_transformed['original_name'].fillna('Unknown Campaign')
+            
+            # Convert numeric columns
+            numeric_columns = {
+                'impressions': 'int64',
+                'clicks': 'int64',
+                'cost': 'float64',
+                'conversions': 'int64',
+                'revenue': 'float64',
+                'campaign_count': 'int64'
+            }
+            
+            for col, dtype in numeric_columns.items():
+                if col in df_transformed.columns:
+                    df_transformed[col] = pd.to_numeric(df_transformed[col], errors='coerce')
+                    if col in ['cost', 'revenue']:
+                        df_transformed[col] = df_transformed[col].fillna(0).round(2)
+                    else:
+                        df_transformed[col] = df_transformed[col].fillna(0).astype(dtype)
+            
+            # Remove duplicates
+            key_columns = ['date', 'service', 'campaign_channel_type', 'original_name']
+            initial_count = len(df_transformed)
+            df_transformed = df_transformed.drop_duplicates(subset=key_columns, keep='first')
+            
+            if initial_count != len(df_transformed):
+                logger.warning(f"   Removed {initial_count - len(df_transformed)} duplicate rows")
+            
+            self.stats.rows_transformed = len(df_transformed)
+            
+            elapsed_time = (datetime.now() - start_time).total_seconds()
+            logger.info(f"✅ TRANSFORM completed in {elapsed_time:.1f}s")
+            logger.info(f"   Rows transformed: {self.stats.rows_transformed:,}")
+            
+            return df_transformed
+            
+        except Exception as e:
+            logger.error(f"❌ TRANSFORM failed: {e}")
+            raise
+    
+    def load_with_upsert(self, df: pd.DataFrame) -> int:
+        """LOAD: UPSERT data into PostgreSQL table"""
+        if df.empty:
+            logger.warning("No data to load")
+            return 0
+        
+        start_time = datetime.now()
+        logger.info(f"💾 LOAD: UPSERTing {len(df):,} rows to {SCHEMA_NAME}.{TABLE_NAME}...")
+        
+        try:
+            with self.pg_engine.begin() as connection:
+                # Create temporary table
+                temp_table_name = f"temp_google_ads_{int(datetime.now().timestamp())}"
+                
+                # First, ensure schema exists
+                connection.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"))
+                
+                # Create temp table
+                connection.execute(text(f"""
+                    CREATE TEMP TABLE {temp_table_name} (
+                        date DATE,
+                        service TEXT,
+                        city TEXT,
+                        campaign_type TEXT,
+                        campaign_channel_type TEXT,
+                        original_name TEXT,
+                        impressions BIGINT,
+                        clicks BIGINT,
+                        cost NUMERIC(15, 2),
+                        conversions BIGINT,
+                        revenue NUMERIC(15, 2),
+                        campaign_count INTEGER
+                    ) ON COMMIT DROP
+                """))
+                
+                # Prepare data
+                columns = ['date', 'service', 'city', 'campaign_type', 'campaign_channel_type', 
+                          'original_name', 'impressions', 'clicks', 'cost', 'conversions', 
+                          'revenue', 'campaign_count']
+                
+                temp_df = df[columns].copy()
+                temp_df['date'] = temp_df['date'].dt.strftime('%Y-%m-%d')
+                temp_df = temp_df.where(pd.notna(temp_df), None)
+                
+                # Load to temp table
+                temp_df.to_sql(
+                    temp_table_name,
+                    connection,
+                    if_exists='append',
+                    index=False,
+                    method='multi',
+                    chunksize=CHUNK_SIZE
+                )
+                
+                logger.info(f"   Loaded {len(temp_df):,} rows to temp table")
+                
+                # Create target table if it doesn't exist
+                connection.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}.{TABLE_NAME} (
+                        date DATE,
+                        service TEXT,
+                        city TEXT,
+                        campaign_type TEXT,
+                        campaign_channel_type TEXT,
+                        original_name TEXT,
+                        impressions BIGINT,
+                        clicks BIGINT,
+                        cost NUMERIC(15, 2),
+                        conversions BIGINT,
+                        revenue NUMERIC(15, 2),
+                        campaign_count INTEGER,
+                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (date, service, campaign_channel_type, original_name)
+                    )
+                """))
+                
+                # Perform UPSERT
+                upsert_sql = text(f"""
+                    INSERT INTO {SCHEMA_NAME}.{TABLE_NAME} 
+                    (date, service, city, campaign_type, campaign_channel_type, original_name,
+                     impressions, clicks, cost, conversions, revenue, campaign_count)
+                    SELECT 
+                        date::DATE,
+                        service,
+                        city,
+                        campaign_type,
+                        campaign_channel_type,
+                        original_name,
+                        impressions,
+                        clicks,
+                        cost,
+                        conversions,
+                        revenue,
+                        campaign_count
+                    FROM {temp_table_name}
+                    ON CONFLICT (date, service, campaign_channel_type, original_name) 
+                    DO UPDATE SET
+                        city = EXCLUDED.city,
+                        campaign_type = EXCLUDED.campaign_type,
+                        impressions = EXCLUDED.impressions,
+                        clicks = EXCLUDED.clicks,
+                        cost = EXCLUDED.cost,
+                        conversions = EXCLUDED.conversions,
+                        revenue = EXCLUDED.revenue,
+                        campaign_count = EXCLUDED.campaign_count,
+                        last_updated = CURRENT_TIMESTAMP
+                """)
+                
+                result = connection.execute(upsert_sql)
+                rows_upserted = result.rowcount
+                
+                self.stats.rows_upserted = rows_upserted
+                
+                elapsed_time = (datetime.now() - start_time).total_seconds()
+                logger.info(f"✅ LOAD completed in {elapsed_time:.1f}s")
+                logger.info(f"   Rows upserted: {rows_upserted:,}")
+                
+                return rows_upserted
+                
+        except Exception as e:
+            logger.error(f"❌ LOAD failed: {e}")
+            raise
+    
+    def run_etl(self) -> bool:
+        """Run the complete ETL process"""
+        start_time = datetime.now()
+        
+        logger.info("=" * 80)
+        logger.info("✅ GOOGLE ADS FIXED ETL (NO CAMPAIGN STATUS FILTER)")
+        logger.info("=" * 80)
+        logger.info(f"📅 Date range: {self.start_date} to {self.end_date}")
+        logger.info(f"🎯 Target: {SCHEMA_NAME}.{TABLE_NAME}")
+        logger.info("=" * 80)
+        
+        try:
+            # Step 1: EXTRACT
+            logger.info("Step 1: EXTRACT from BigQuery...")
+            df_raw = self.extract_from_bigquery()
+            
+            if df_raw.empty:
+                logger.info("No data to process")
+                return True
+            
+            # Step 2: TRANSFORM
+            logger.info("Step 2: TRANSFORM data...")
+            df_clean = self.transform_data(df_raw)
+            
+            if df_clean.empty:
+                logger.info("No valid data after transformation")
+                return True
+            
+            # Step 3: LOAD
+            logger.info("Step 3: LOAD with UPSERT...")
+            rows_loaded = self.load_with_upsert(df_clean)
+            
+            # Final statistics
+            self.stats.execution_time = (datetime.now() - start_time).total_seconds()
+            
+            logger.info("=" * 80)
+            logger.info("✅ ETL COMPLETE")
+            logger.info("=" * 80)
+            logger.info(f"⏱️  Total execution time: {self.stats.execution_time:.1f}s")
+            logger.info(f"📥 Rows extracted: {self.stats.rows_extracted:,}")
+            logger.info(f"🔄 Rows transformed: {self.stats.rows_transformed:,}")
+            logger.info(f"💾 Rows upserted: {self.stats.rows_upserted:,}")
+            logger.info("=" * 80)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ ETL failed: {e}", exc_info=True)
+            return False
+
+def main():
+    """Main execution function"""
+    try:
+        import argparse
+        parser = argparse.ArgumentParser(
+            description='Google Ads Fixed ETL (No Campaign Status Filter)'
+        )
+        
+        parser.add_argument('--start-date', type=str, default=FIXED_START_DATE,
+                          help=f'Start date (YYYY-MM-DD). Default: {FIXED_START_DATE}')
+        parser.add_argument('--end-date', type=str,
+                          help='End date (YYYY-MM-DD). Default: yesterday')
+        parser.add_argument('--debug', action='store_true',
+                          help='Enable debug logging')
+        parser.add_argument('--test-limit', type=int,
+                          help='Limit rows for testing (adds LIMIT clause)')
+        
+        args = parser.parse_args()
+        
+        if args.debug:
+            logging.getLogger().setLevel(logging.DEBUG)
+        
+        # Initialize and run ETL
+        etl = GoogleAdsFixedETL(start_date=args.start_date, end_date=args.end_date)
+        success = etl.run_etl()
+        
+        return 0 if success else 1
+        
+    except KeyboardInterrupt:
+        logger.info("ETL interrupted by user")
+        return 130
+    except Exception as e:
+        logger.error(f"Script failed: {e}")
+        return 1
+
+if __name__ == "__main__":
+    exit_code = main()
+    sys.exit(exit_code)

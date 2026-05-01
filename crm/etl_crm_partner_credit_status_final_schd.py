@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""
+ETL Script - Auto-fixed version
+"""
+import os
+import sys
+
+# AUTO-FIX: Add project root to Python path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+import os
+from dotenv import load_dotenv
+import psycopg2
+import psycopg2.extras
+
+load_dotenv()
+
+PG_HOST = os.getenv("PG_HOST")
+PG_PORT = os.getenv("PG_PORT")
+PG_DB   = os.getenv("PG_DB")
+PG_USER = os.getenv("PG_USER")
+PG_PASS = os.getenv("PG_PASS")
+
+print("[INFO] Connecting to PostgreSQL...")
+
+pg_conn = psycopg2.connect(
+    host=PG_HOST,
+    port=PG_PORT,
+    database=PG_DB,
+    user=PG_USER,
+    password=PG_PASS
+)
+
+pg_cursor = pg_conn.cursor()
+
+print("[INFO] Connected.")
+
+credit_sql = """
+WITH master AS (
+    SELECT 
+        partner_type,
+        id AS company_id,
+        lead_status,
+        created_at
+    FROM crm_data.partner_master_companies
+    WHERE created_at >= DATE '2024-10-01'
+),
+
+credit_logs AS (
+    SELECT
+        l.partner_type,
+        l.company_id,
+        l.section,
+        l.created_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY l.partner_type, l.company_id
+            ORDER BY l.created_at DESC
+        ) AS rn
+    FROM crm_data.partner_company_logs l
+    INNER JOIN master m
+        ON m.partner_type = l.partner_type
+       AND m.company_id = l.company_id
+    WHERE LOWER(l.section) LIKE '%credit%'
+),
+
+latest_credit AS (
+    SELECT
+        partner_type,
+        company_id,
+        created_at AS last_event_at,
+        section AS last_section
+    FROM credit_logs
+    WHERE rn = 1
+)
+
+SELECT
+    m.partner_type,
+    m.company_id,
+    m.lead_status,
+    m.created_at AS partner_created_at,
+    lc.last_event_at,
+    lc.last_section,
+    CASE
+        WHEN lc.last_section IS NULL
+            THEN 'out_of_credit'
+        WHEN LOWER(lc.last_section) LIKE '%out-of-credit%'
+            THEN 'out_of_credit'
+        ELSE 'in_credit'
+    END AS credit_status
+FROM master m
+LEFT JOIN latest_credit lc
+    ON m.partner_type = lc.partner_type
+   AND m.company_id = lc.company_id;
+"""
+
+print("[INFO] Fetching credit status data...")
+
+pg_cursor.execute(credit_sql)
+rows = pg_cursor.fetchall()
+
+print(f"[INFO] Retrieved {len(rows)} credit-status rows.")
+
+upsert_sql = """
+INSERT INTO crm_data.partner_credit_status (
+    partner_type,
+    company_id,
+    lead_status,
+    partner_created_at,
+    last_event_at,
+    last_section,
+    credit_status,
+    loaded_at
+)
+VALUES %s
+ON CONFLICT (partner_type, company_id)
+DO UPDATE SET
+    lead_status = EXCLUDED.lead_status,
+    partner_created_at = EXCLUDED.partner_created_at,
+    last_event_at = EXCLUDED.last_event_at,
+    last_section = EXCLUDED.last_section,
+    credit_status = EXCLUDED.credit_status,
+    loaded_at = NOW();
+"""
+
+data = [
+    (
+        r[0],  # partner_type
+        r[1],  # company_id
+        r[2],  # lead_status
+        r[3],  # partner_created_at
+        r[4],  # last_event_at
+        r[5],  # last_section
+        r[6],  # credit_status
+        None
+    )
+    for r in rows
+]
+
+psycopg2.extras.execute_values(pg_cursor, upsert_sql, data)
+pg_conn.commit()
+
+print(f"[SUCCESS] Upserted {len(data)} rows into crm_data.partner_credit_status")
+
+pg_cursor.close()
+pg_conn.close()
+
+print("[DONE] Credit status ETL completed.")

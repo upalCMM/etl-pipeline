@@ -1,0 +1,153 @@
+# BigQuery ETL Test Results - Mon Jan 26 09:15:39 GMT 2026
+========================================
+🔍 Script analysis:
+  📊 Type: Google Analytics 4
+  ⚠️  No test mode detected
+
+🚀 Executing ga4_landing_pages_update_final_schd.py ...
+2026-01-26 09:15:39,804 - INFO - Connecting to BigQuery...
+2026-01-26 09:15:39,804 - ERROR - Failed to initialize clients: 'project'
+2026-01-26 09:15:39,804 - ERROR - ETL failed: 'project'
+
+📊 Execution summary:
+  Duration: 0s
+  Exit code: 1
+  Status: ❌ FAILED
+  Last 5 lines:
+2026-01-26 09:15:39,804 - INFO - Connecting to BigQuery...
+2026-01-26 09:15:39,804 - ERROR - Failed to initialize clients: 'project'
+2026-01-26 09:15:39,804 - ERROR - ETL failed: 'project'
+========================================
+========================================
+🔍 Script analysis:
+  📊 Type: Google Analytics 4
+  ⚠️  No test mode detected
+
+🚀 Executing ga4_referrer_sessions_update_final_schd.py ...
+2026-01-26 09:15:40,449 - INFO - 🔌 Connecting to BigQuery...
+2026-01-26 09:15:40,449 - ERROR - ❌ Failed to initialize clients: 'project'
+Traceback (most recent call last):
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/ga4_referrer_sessions_update_final_schd.py", line 260, in <module>
+    main()
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/ga4_referrer_sessions_update_final_schd.py", line 255, in main
+    loader = GA4IncrementalLoader()
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/ga4_referrer_sessions_update_final_schd.py", line 48, in __init__
+    self.setup_clients()
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/ga4_referrer_sessions_update_final_schd.py", line 56, in setup_clients
+    project=BIGQUERY_CONFIG['project']
+            ~~~~~~~~~~~~~~~^^^^^^^^^^^
+KeyError: 'project'
+
+📊 Execution summary:
+  Duration: 1s
+  Exit code: 1
+  Status: ❌ FAILED
+  Last 5 lines:
+    self.setup_clients()
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/ga4_referrer_sessions_update_final_schd.py", line 56, in setup_clients
+    project=BIGQUERY_CONFIG['project']
+            ~~~~~~~~~~~~~~~^^^^^^^^^^^
+KeyError: 'project'
+========================================
+========================================
+🔍 Script analysis:
+  🔍 Type: Google Search Console
+  ⚠️  No test mode detected
+
+🚀 Executing gsc_daily_update_final_schd.py ...
+2026-01-26 09:15:41,096 - INFO - ===============================================================
+2026-01-26 09:15:41,096 - INFO - 🚀 Starting GSC Daily Incremental ETL
+2026-01-26 09:15:41,096 - INFO - ===============================================================
+2026-01-26 09:15:41,159 - INFO - Checking latest GSC date already loaded in Postgres...
+2026-01-26 09:15:41,235 - INFO - Latest GSC date found: 2026-01-20
+Traceback (most recent call last):
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/gsc_daily_update_final_schd.py", line 192, in <module>
+    main()
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/gsc_daily_update_final_schd.py", line 183, in main
+    df = load_from_bigquery(start_date)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/gsc_daily_update_final_schd.py", line 82, in load_from_bigquery
+    client = bq_client()
+             ^^^^^^^^^^^
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/gsc_daily_update_final_schd.py", line 56, in bq_client
+    project=BIGQUERY_CONFIG["project"]
+            ~~~~~~~~~~~~~~~^^^^^^^^^^^
+KeyError: 'project'
+
+📊 Execution summary:
+  Duration: 1s
+  Exit code: 1
+  Status: ❌ FAILED
+  Last 5 lines:
+             ^^^^^^^^^^^
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/gsc_daily_update_final_schd.py", line 56, in bq_client
+    project=BIGQUERY_CONFIG["project"]
+            ~~~~~~~~~~~~~~~^^^^^^^^^^^
+KeyError: 'project'
+========================================
+========================================
+🔍 Script analysis:
+  📢 Type: Google Ads
+  ⚠️  No test mode detected
+
+🚀 Executing update_google_ads_data_final_schd.py ...
+2026-01-26 09:15:41,875 - __main__ - INFO - Initializing BigQuery client...
+2026-01-26 09:15:41,877 - __main__ - INFO - ✅ BigQuery client connected
+2026-01-26 09:15:41,896 - __main__ - INFO - ✅ PostgreSQL engine created
+2026-01-26 09:15:41,896 - __main__ - INFO - ✅ ETL initialized with date range: 2025-01-01 to 2026-01-25
+2026-01-26 09:15:41,896 - __main__ - INFO - ⚠ IMPORTANT: Using FIXED query that includes ALL campaign statuses (ENABLED, PAUSED, REMOVED)
+2026-01-26 09:15:41,897 - __main__ - INFO - ================================================================================
+2026-01-26 09:15:41,897 - __main__ - INFO - ✅ GOOGLE ADS FIXED ETL (NO CAMPAIGN STATUS FILTER)
+2026-01-26 09:15:41,897 - __main__ - INFO - ================================================================================
+2026-01-26 09:15:41,897 - __main__ - INFO - 📅 Date range: 2025-01-01 to 2026-01-25
+2026-01-26 09:15:41,897 - __main__ - INFO - 🎯 Target: google_data.google_ads_daily
+2026-01-26 09:15:41,897 - __main__ - INFO - ================================================================================
+2026-01-26 09:15:41,897 - __main__ - INFO - Step 1: EXTRACT from BigQuery...
+2026-01-26 09:15:41,897 - __main__ - INFO - 📥 EXTRACT: Fetching Google Ads data from 2025-01-01 to 2026-01-25...
+2026-01-26 09:15:43,987 - __main__ - INFO - 🚀 BigQuery query executing...
+/home/upalcmm/scripts/venv/lib/python3.12/site-packages/google/cloud/bigquery/table.py:1994: UserWarning: BigQuery Storage module not found, fetch data with the REST endpoint instead.
+  warnings.warn(
+2026-01-26 09:16:21,350 - __main__ - INFO - ✅ EXTRACT completed in 39.5s
+2026-01-26 09:16:21,350 - __main__ - INFO -    Rows extracted: 421,396
+2026-01-26 09:16:21,361 - __main__ - INFO - 
+📊 EXTRACT ANALYSIS:
+2026-01-26 09:16:21,363 - __main__ - INFO -    Date range in data: 2025-01-01 to 2026-01-24
+2026-01-26 09:16:21,363 - __main__ - INFO -    Total impressions: 22,013,953
+2026-01-26 09:16:21,363 - __main__ - INFO -    Total cost: £4,217,208.24
+2026-01-26 09:16:21,364 - __main__ - INFO -    Unique campaigns: 421,921
+2026-01-26 09:16:21,364 - __main__ - INFO - ✅ All campaigns have proper names!
+2026-01-26 09:16:21,364 - __main__ - INFO - 
+🎯 Sample of parsed campaign names:
+2026-01-26 09:16:21,364 - __main__ - INFO -    Conveyancing - England - PMAX
+2026-01-26 09:16:21,364 - __main__ - INFO -      → Service: Conveyancing, City: England, Type: PMAX
+2026-01-26 09:16:21,365 - __main__ - INFO -    Removals - London - Locations
+2026-01-26 09:16:21,365 - __main__ - INFO -      → Service: Removals, City: London, Type: Locations
+2026-01-26 09:16:21,365 - __main__ - INFO -    Conveyancing - Birmingham - Keywords
+2026-01-26 09:16:21,365 - __main__ - INFO -      → Service: Conveyancing, City: Birmingham, Type: Keywords
+2026-01-26 09:16:21,365 - __main__ - INFO - Step 2: TRANSFORM data...
+2026-01-26 09:16:21,365 - __main__ - INFO - 🔄 TRANSFORM: Processing data...
+2026-01-26 09:16:21,918 - __main__ - INFO - ✅ TRANSFORM completed in 0.6s
+2026-01-26 09:16:21,918 - __main__ - INFO -    Rows transformed: 421,396
+2026-01-26 09:16:21,919 - __main__ - INFO - Step 3: LOAD with UPSERT...
+2026-01-26 09:16:21,919 - __main__ - INFO - 💾 LOAD: UPSERTing 421,396 rows to google_data.google_ads_daily...
+2026-01-26 09:17:08,461 - __main__ - INFO -    Loaded 421,396 rows to temp table
+2026-01-26 09:17:28,806 - __main__ - INFO - ✅ LOAD completed in 66.9s
+2026-01-26 09:17:28,806 - __main__ - INFO -    Rows upserted: 421,396
+2026-01-26 09:17:28,825 - __main__ - INFO - ================================================================================
+2026-01-26 09:17:28,825 - __main__ - INFO - ✅ ETL COMPLETE
+2026-01-26 09:17:28,825 - __main__ - INFO - ================================================================================
+2026-01-26 09:17:28,825 - __main__ - INFO - ⏱️  Total execution time: 106.9s
+2026-01-26 09:17:28,825 - __main__ - INFO - 📥 Rows extracted: 421,396
+2026-01-26 09:17:28,825 - __main__ - INFO - 🔄 Rows transformed: 421,396
+2026-01-26 09:17:28,825 - __main__ - INFO - 💾 Rows upserted: 421,396
+2026-01-26 09:17:28,825 - __main__ - INFO - ================================================================================
+
+📊 Execution summary:
+  Duration: 108s
+  Exit code: 0
+  Status: ✅ SUCCESS
+  Metrics:
+2026-01-26 09:17:28,825 - __main__ - INFO - 🔄 Rows transformed: 421,396
+2026-01-26 09:17:28,825 - __main__ - INFO - 💾 Rows upserted: 421,396
+========================================

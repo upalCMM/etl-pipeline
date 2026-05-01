@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+"""
+ETL Script - Complete Pipedrive to CRM Pipeline
+- Syncs Pipedrive deals data
+- Updates STU/TTU partner deals
+- Updates CRM partner cohorts and credit status
+"""
+import os
+import sys
+
+# AUTO-FIX: Add project root to Python path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+# ===== UNICODE FIX FOR WINDOWS =====
+import io
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+# ==================================================
+
+import requests
+from sqlalchemy import create_engine, text
+import logging
+import urllib3
+from datetime import datetime, timedelta
+import time
+from typing import List, Dict, Any, Optional, Union
+from dataclasses import dataclass
+import json
+
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+from config import PIPEDRIVE_API_TOKEN, PIPEDRIVE_BASE_URL, DB_CONFIG
+
+# ==================================================
+# CUSTOM PIPEDRIVE FIELD KEYS
+# ==================================================
+PARTNER_SUPPORT_NAME_FIELD = "5c1c9a8eb75797a163a24eb86cac7e9ff5135540"   # field_type = user
+DEAL_CREATED_FIELD = "74e8781a0bf2f2dab51bb0998444ff9054536092"           # field_type = date
+
+
+@dataclass
+class SyncStats:
+    """Data class to track sync statistics"""
+    updated: int = 0
+    inserted: int = 0
+    errors: int = 0
+    start_time: datetime = None
+    end_time: datetime = None
+    
+    def __post_init__(self):
+        self.start_time = datetime.now()
+    
+    def duration(self) -> float:
+        if self.end_time:
+            return (self.end_time - self.start_time).total_seconds()
+        return (datetime.now() - self.start_time).total_seconds()
+    
+    def print_summary(self, data_type: str):
+        self.end_time = datetime.now()
+        print(f"\n📊 {data_type.upper()} SYNC SUMMARY:")
+        print(f"   ⏱️  Duration: {self.duration():.1f} seconds")
+        print(f"   ✅ Updated: {self.updated:,}")
+        print(f"   ➕ Inserted: {self.inserted:,}")
+        print(f"   ❌ Errors: {self.errors:,}")
+        print(f"   📈 Total: {self.updated + self.inserted:,}")
+
+
+class PipedriveAPIClient:
+    """API client for Pipedrive with retry logic"""
+    
+    def __init__(self, base_url: str, api_token: str):
+        self.base_url = base_url.rstrip('/')
+        self.api_token = api_token
+        self.session = requests.Session()
+        
+        # Disable SSL verification for internal scripts
+        self.session.verify = False
+        
+        self.session.timeout = (30, 60)  # Connect timeout, read timeout
+        self.max_retries = 3
+        self.retry_delay = 1
+    
+    def make_request(self, endpoint: str, params: dict = None) -> Optional[Dict]:
+        """Make API request with retry logic"""
+        url = f"{self.base_url}/{endpoint}"
+        params = params or {}
+        params['api_token'] = self.api_token
+        
+        for attempt in range(self.max_retries):
+            try:
+                response = self.session.get(url, params=params, verify=False)
+                
+                # Handle 404 specifically for endpoints that might not exist
+                if response.status_code == 404:
+                    print(f"⚠️  Endpoint not found: {endpoint}")
+                    return None
+                    
+                response.raise_for_status()
+                data = response.json()
+                
+                if not data.get('success', True):
+                    print(f"⚠️  API returned error: {data.get('error')}")
+                    return None
+                
+                return data
+                
+            except requests.exceptions.Timeout:
+                if attempt < self.max_retries - 1:
+                    print(f"⏱️  Timeout, retrying in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                    self.retry_delay *= 2  # Exponential backoff
+                else:
+                    print("❌ Max retries exceeded for timeout")
+                    return None
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"❌ Request failed: {e}")
+                return None
+            except json.JSONDecodeError as e:
+                print(f"❌ Failed to parse JSON response: {e}")
+                return None
+        
+        return None
+    
+    def fetch_all_paginated(self, endpoint: str, limit: int = 500) -> List[Dict]:
+        """Fetch all paginated data from an endpoint"""
+        all_data = []
+        start = 0
+        has_more = True
+        batch_num = 0
+        
+        print(f"📊 Fetching {endpoint} data...")
+        
+        while has_more:
+            batch_num += 1
+            params = {
+                'start': start,
+                'limit': limit
+            }
+            
+            data = self.make_request(endpoint, params)
+            if not data:
+                if batch_num == 1:  # First request failed
+                    print(f"❌ Failed to fetch data for {endpoint}")
+                break
+            
+            batch_data = data.get('data', [])
+            all_data.extend(batch_data)
+            
+            print(f"   📥 Batch {batch_num}: Fetched {len(batch_data)} records (Total: {len(all_data):,})")
+            
+            # Check pagination
+            pagination = data.get('additional_data', {}).get('pagination', {})
+            has_more = pagination.get('more_items_in_collection', False)
+            start = pagination.get('next_start', 0)
+            
+            if not has_more:
+                break
+        
+        print(f"✅ Total {endpoint} records fetched: {len(all_data):,}")
+        return all_data
+
+
+class DataExtractor:
+    """Helper class for extracting and transforming data"""
+    
+    @staticmethod
+    def extract_label_ids(deal: Dict) -> Optional[List[int]]:
+        """Extract all label IDs from deal data"""
+        label_data = deal.get('label')
+        
+        if not label_data:
+            return None
+        
+        label_ids = []
+        
+        # Handle list of labels
+        if isinstance(label_data, list):
+            for label in label_data:
+                if isinstance(label, dict) and 'id' in label:
+                    label_ids.append(label['id'])
+                elif isinstance(label, (int, str)):
+                    parsed_ids = DataExtractor._parse_label_value(label)
+                    if parsed_ids:
+                        label_ids.extend(parsed_ids)
+        
+        # Handle single label object
+        elif isinstance(label_data, dict) and 'id' in label_data:
+            label_ids.append(label_data['id'])
+        
+        # Handle single ID or comma-separated string
+        elif isinstance(label_data, (int, str)):
+            parsed_ids = DataExtractor._parse_label_value(label_data)
+            if parsed_ids:
+                label_ids.extend(parsed_ids)
+        
+        return label_ids if label_ids else None
+    
+    @staticmethod
+    def _parse_label_value(label_value: Union[int, str]) -> List[int]:
+        """Parse label value that could be int or comma-separated string"""
+        try:
+            if isinstance(label_value, str) and ',' in label_value:
+                return [int(lbl.strip()) for lbl in label_value.split(',') if lbl.strip().isdigit()]
+            else:
+                return [int(label_value)]
+        except (ValueError, TypeError):
+            return []
+    
+    @staticmethod
+    def extract_user_id(deal: Dict) -> Optional[int]:
+        """Extract user_id from deal data"""
+        # Check different possible locations
+        user_sources = [
+            deal.get('user_id'),
+            deal.get('owner'),
+            deal.get('additional_data', {}).get('user_id')
+        ]
+        
+        for source in user_sources:
+            if source:
+                if isinstance(source, dict):
+                    user_id = source.get('id') or source.get('value')
+                    if user_id and str(user_id).isdigit():
+                        return int(user_id)
+                elif isinstance(source, (int, str)) and str(source).isdigit():
+                    return int(source)
+        
+        return None
+    
+    @staticmethod
+    def extract_org_person_ids(deal: Dict) -> tuple:
+        """Extract organization and person IDs"""
+        org_data = deal.get('org_id', {})
+        person_data = deal.get('person_id', {})
+        
+        def extract_id(data):
+            if isinstance(data, dict):
+                return data.get('value') or data.get('id')
+            return data
+        
+        org_id = extract_id(org_data)
+        person_id = extract_id(person_data)
+        
+        # Convert to integer if possible
+        try:
+            org_id = int(org_id) if org_id is not None and str(org_id).isdigit() else None
+            person_id = int(person_id) if person_id is not None and str(person_id).isdigit() else None
+        except (ValueError, TypeError):
+            pass
+        
+        return org_id, person_id
+    
+    @staticmethod
+    def parse_timestamp(timestamp_str: str) -> Optional[datetime]:
+        """Parse timestamp string to datetime object"""
+        if not timestamp_str:
+            return None
+        
+        try:
+            # Handle different timestamp formats
+            if 'Z' in timestamp_str:
+                timestamp_str = timestamp_str.replace('Z', '+00:00')
+            return datetime.fromisoformat(timestamp_str.replace('Z', ''))
+        except (ValueError, AttributeError):
+            try:
+                # Try parsing with dateutil if available
+                from dateutil import parser
+                return parser.parse(timestamp_str)
+            except:
+                return None
+
+    @staticmethod
+    def parse_date(date_str: str):
+        """Parse date field to Python date"""
+        if not date_str:
+            return None
+        
+        try:
+            return datetime.strptime(date_str, "%Y-%m-%d").date()
+        except Exception:
+            try:
+                from dateutil import parser
+                return parser.parse(date_str).date()
+            except Exception:
+                return None
+
+    @staticmethod
+    def extract_partner_support_user_id(deal: Dict) -> Optional[int]:
+        """Extract Partner_Support_Name user field as user_id"""
+        value = deal.get(PARTNER_SUPPORT_NAME_FIELD)
+        if value is None:
+            return None
+        
+        if isinstance(value, dict):
+            user_id = value.get('id') or value.get('value')
+            if user_id and str(user_id).isdigit():
+                return int(user_id)
+            return None
+        
+        if isinstance(value, (int, str)) and str(value).isdigit():
+            return int(value)
+        
+        return None
+
+
+class DatabaseManager:
+    """Database connection and operation manager"""
+    
+    def __init__(self, db_config: dict):
+        self.engine = create_engine(
+            f"postgresql://{db_config['user']}:{db_config['password']}"
+            f"@{db_config['host']}:{db_config['port']}/{db_config['database']}"
+        )
+        self.extractor = DataExtractor()
+    
+    def ensure_tables_exist(self):
+        """Ensure all required tables exist"""
+        with self.engine.connect() as conn:
+            # Create fact_pipedrive_deals_raw table
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS pipedrive.fact_pipedrive_deals_raw (
+                    id INTEGER PRIMARY KEY,
+                    title VARCHAR(500),
+                    value DECIMAL(15,2),
+                    currency VARCHAR(10),
+                    person_id INTEGER,
+                    org_id INTEGER,
+                    stage_id INTEGER,
+                    status VARCHAR(20),
+                    lost_reason TEXT,
+                    add_time TIMESTAMP,
+                    update_time TIMESTAMP,
+                    stage_change_time TIMESTAMP,
+                    won_time TIMESTAMP,
+                    lost_time TIMESTAMP,
+                    close_time TIMESTAMP,
+                    active BOOLEAN,
+                    pipeline_id INTEGER,
+                    channel VARCHAR(100),
+                    label_id INTEGER[],
+                    user_id INTEGER,
+                    partner_support_user_id INTEGER,
+                    deal_created_date DATE,
+                    sync_timestamp TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            
+            # Create indexes for fact_pipedrive_deals_raw table
+            for index_sql in [
+                "CREATE INDEX IF NOT EXISTS idx_deals_org ON pipedrive.fact_pipedrive_deals_raw (org_id)",
+                "CREATE INDEX IF NOT EXISTS idx_deals_pipeline ON pipedrive.fact_pipedrive_deals_raw (pipeline_id)",
+                "CREATE INDEX IF NOT EXISTS idx_deals_status ON pipedrive.fact_pipedrive_deals_raw (status)",
+                "CREATE INDEX IF NOT EXISTS idx_deals_add_time ON pipedrive.fact_pipedrive_deals_raw (add_time)",
+                "CREATE INDEX IF NOT EXISTS idx_deals_won_time ON pipedrive.fact_pipedrive_deals_raw (won_time)",
+                "CREATE INDEX IF NOT EXISTS idx_deals_lost_time ON pipedrive.fact_pipedrive_deals_raw (lost_time)",
+                "CREATE INDEX IF NOT EXISTS idx_deals_active ON pipedrive.fact_pipedrive_deals_raw (active)"
+            ]:
+                try:
+                    conn.execute(text(index_sql))
+                except:
+                    pass
+            
+            # Create fact_pipedrive_deals_processed table
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS pipedrive.fact_pipedrive_deals_processed (
+                    deal_id INTEGER PRIMARY KEY,
+                    title VARCHAR(500),
+                    value DECIMAL(15,2),
+                    currency VARCHAR(10),
+                    stage_id INTEGER,
+                    status VARCHAR(20),
+                    created_date TIMESTAMP,
+                    last_updated TIMESTAMP,
+                    stage_change_time TIMESTAMP,
+                    won_time TIMESTAMP,
+                    lost_time TIMESTAMP,
+                    close_time TIMESTAMP,
+                    active BOOLEAN,
+                    days_in_pipeline INTEGER,
+                    days_to_win INTEGER,
+                    days_to_lose INTEGER,
+                    deal_status VARCHAR(20),
+                    org_id INTEGER,
+                    org_name VARCHAR(500),
+                    pipeline_id INTEGER,
+                    channel VARCHAR(100),
+                    label_id INTEGER[],
+                    user_id INTEGER,
+                    partner_support_user_id INTEGER,
+                    deal_created_date DATE,
+                    sync_timestamp TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            
+            # Add useful indexes for processed table
+            for index_sql in [
+                "CREATE INDEX IF NOT EXISTS idx_processed_pipeline ON pipedrive.fact_pipedrive_deals_processed (pipeline_id)",
+                "CREATE INDEX IF NOT EXISTS idx_processed_deal_status ON pipedrive.fact_pipedrive_deals_processed (deal_status)",
+                "CREATE INDEX IF NOT EXISTS idx_processed_won_time ON pipedrive.fact_pipedrive_deals_processed (won_time)",
+                "CREATE INDEX IF NOT EXISTS idx_processed_created_date ON pipedrive.fact_pipedrive_deals_processed (created_date)"
+            ]:
+                try:
+                    conn.execute(text(index_sql))
+                except:
+                    pass
+            
+            # Add missing columns if they don't exist
+            for column_sql in [
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_raw ADD COLUMN IF NOT EXISTS won_time TIMESTAMP",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_raw ADD COLUMN IF NOT EXISTS lost_time TIMESTAMP",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_raw ADD COLUMN IF NOT EXISTS close_time TIMESTAMP",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_raw ADD COLUMN IF NOT EXISTS partner_support_user_id INTEGER",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_raw ADD COLUMN IF NOT EXISTS deal_created_date DATE",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_processed ADD COLUMN IF NOT EXISTS won_time TIMESTAMP",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_processed ADD COLUMN IF NOT EXISTS lost_time TIMESTAMP",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_processed ADD COLUMN IF NOT EXISTS close_time TIMESTAMP",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_processed ADD COLUMN IF NOT EXISTS days_to_win INTEGER",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_processed ADD COLUMN IF NOT EXISTS days_to_lose INTEGER",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_processed ADD COLUMN IF NOT EXISTS partner_support_user_id INTEGER",
+                "ALTER TABLE pipedrive.fact_pipedrive_deals_processed ADD COLUMN IF NOT EXISTS deal_created_date DATE"
+            ]:
+                try:
+                    conn.execute(text(column_sql))
+                except:
+                    pass
+            
+            conn.commit()
+            print("✅ Database tables and indexes verified/created")
+    
+    def sync_deals_only(self, deals: List[Dict]) -> SyncStats:
+        """Sync only deals data"""
+        stats = SyncStats()
+        
+        if not deals:
+            print("⚠️  No deals data to sync")
+            return stats
+        
+        with self.engine.connect() as conn:
+            trans = conn.begin()
+            try:
+                print("🔄 Upserting deals data...")
+                
+                # Track additional statistics
+                multi_label_count = 0
+                deals_with_user_id = 0
+                won_deals = 0
+                lost_deals = 0
+                
+                inserted = 0
+                updated = 0
+                
+                # Process in batches
+                batch_size = 500
+                total_deals = len(deals)
+                
+                for i in range(0, total_deals, batch_size):
+                    batch = deals[i:i+batch_size]
+                    
+                    for deal in batch:
+                        try:
+                            # Extract data
+                            deal_id = deal.get('id')
+                            if not deal_id:
+                                stats.errors += 1
+                                continue
+                            
+                            org_id, person_id = self.extractor.extract_org_person_ids(deal)
+                            channel = deal.get('channel')
+                            label_ids = self.extractor.extract_label_ids(deal)
+                            user_id = self.extractor.extract_user_id(deal)
+                            partner_support_user_id = self.extractor.extract_partner_support_user_id(deal)
+                            deal_created_date = self.extractor.parse_date(deal.get(DEAL_CREATED_FIELD))
+                            
+                            # Update statistics
+                            if label_ids and len(label_ids) > 1:
+                                multi_label_count += 1
+                            if user_id is not None:
+                                deals_with_user_id += 1
+                            
+                            # Get deal status and times
+                            status = str(deal.get('status', ''))[:20]
+                            won_time = self.extractor.parse_timestamp(deal.get('won_time'))
+                            lost_time = self.extractor.parse_timestamp(deal.get('lost_time'))
+                            close_time = self.extractor.parse_timestamp(deal.get('close_time'))
+                            
+                            # Count won/lost deals
+                            if status == 'won':
+                                won_deals += 1
+                            elif status == 'lost':
+                                lost_deals += 1
+                            
+                            # Clean and prepare data
+                            title = str(deal.get('title', ''))[:500]
+                            value = float(deal.get('value', 0) or 0)
+                            currency = str(deal.get('currency', ''))[:10]
+                            lost_reason = deal.get('lost_reason')
+                            
+                            # Parse timestamps
+                            add_time = self.extractor.parse_timestamp(deal.get('add_time'))
+                            update_time = self.extractor.parse_timestamp(deal.get('update_time'))
+                            stage_change_time = self.extractor.parse_timestamp(deal.get('stage_change_time'))
+                            
+                            # Try to update existing record
+                            result = conn.execute(text("""
+                                UPDATE pipedrive.fact_pipedrive_deals_raw 
+                                SET 
+                                    title = :title,
+                                    value = :value,
+                                    currency = :currency,
+                                    person_id = :person_id,
+                                    org_id = :org_id,
+                                    stage_id = :stage_id,
+                                    status = :status,
+                                    lost_reason = :lost_reason,
+                                    add_time = :add_time,
+                                    update_time = :update_time,
+                                    stage_change_time = :stage_change_time,
+                                    won_time = :won_time,
+                                    lost_time = :lost_time,
+                                    close_time = :close_time,
+                                    active = :active,
+                                    pipeline_id = :pipeline_id,
+                                    channel = :channel,
+                                    label_id = :label_id,
+                                    user_id = :user_id,
+                                    partner_support_user_id = :partner_support_user_id,
+                                    deal_created_date = :deal_created_date,
+                                    sync_timestamp = NOW()
+                                WHERE id = :id
+                                RETURNING id
+                            """), {
+                                'id': deal_id,
+                                'title': title,
+                                'value': value,
+                                'currency': currency,
+                                'person_id': person_id,
+                                'org_id': org_id,
+                                'stage_id': deal.get('stage_id'),
+                                'status': status,
+                                'lost_reason': lost_reason,
+                                'add_time': add_time,
+                                'update_time': update_time,
+                                'stage_change_time': stage_change_time,
+                                'won_time': won_time,
+                                'lost_time': lost_time,
+                                'close_time': close_time,
+                                'active': bool(deal.get('active', False)),
+                                'pipeline_id': deal.get('pipeline_id'),
+                                'channel': channel,
+                                'label_id': label_ids,
+                                'user_id': user_id,
+                                'partner_support_user_id': partner_support_user_id,
+                                'deal_created_date': deal_created_date
+                            })
+                            
+                            # Check if update was successful
+                            updated_id = result.scalar()
+                            if updated_id:
+                                updated += 1
+                            else:
+                                # Insert new record
+                                conn.execute(text("""
+                                    INSERT INTO pipedrive.fact_pipedrive_deals_raw 
+                                    (id, title, value, currency, person_id, org_id, stage_id, status,
+                                     lost_reason, add_time, update_time, stage_change_time,
+                                     won_time, lost_time, close_time, active,
+                                     pipeline_id, channel, label_id, user_id,
+                                     partner_support_user_id, deal_created_date, sync_timestamp)
+                                    VALUES (
+                                        :id, :title, :value, :currency, :person_id, :org_id, :stage_id, :status,
+                                        :lost_reason, :add_time, :update_time, :stage_change_time,
+                                        :won_time, :lost_time, :close_time, :active,
+                                        :pipeline_id, :channel, :label_id, :user_id,
+                                        :partner_support_user_id, :deal_created_date, NOW()
+                                    )
+                                """), {
+                                    'id': deal_id,
+                                    'title': title,
+                                    'value': value,
+                                    'currency': currency,
+                                    'person_id': person_id,
+                                    'org_id': org_id,
+                                    'stage_id': deal.get('stage_id'),
+                                    'status': status,
+                                    'lost_reason': lost_reason,
+                                    'add_time': add_time,
+                                    'update_time': update_time,
+                                    'stage_change_time': stage_change_time,
+                                    'won_time': won_time,
+                                    'lost_time': lost_time,
+                                    'close_time': close_time,
+                                    'active': bool(deal.get('active', False)),
+                                    'pipeline_id': deal.get('pipeline_id'),
+                                    'channel': channel,
+                                    'label_id': label_ids,
+                                    'user_id': user_id,
+                                    'partner_support_user_id': partner_support_user_id,
+                                    'deal_created_date': deal_created_date
+                                })
+                                inserted += 1
+                                
+                        except Exception as e:
+                            stats.errors += 1
+                            print(f"❌ Error processing deal {deal.get('id')}: {e}")
+                            continue
+                    
+                    # Progress update
+                    if (i + len(batch)) % 5000 == 0 or (i + len(batch)) >= total_deals:
+                        print(f"   Progress: {min(i + len(batch), total_deals):,}/{total_deals:,} deals")
+                
+                stats.inserted = inserted
+                stats.updated = updated
+                
+                # Rebuild processed table with won_time, lost_time calculations
+                print("🔄 Rebuilding processed table...")
+                conn.execute(text("TRUNCATE TABLE pipedrive.fact_pipedrive_deals_processed"))
+                
+                conn.execute(text("""
+                    INSERT INTO pipedrive.fact_pipedrive_deals_processed (
+                        deal_id, title, value, currency, stage_id, status, 
+                        created_date, last_updated, stage_change_time,
+                        won_time, lost_time, close_time,
+                        active, days_in_pipeline, days_to_win, days_to_lose,
+                        deal_status, org_id, org_name, pipeline_id, 
+                        channel, label_id, user_id, partner_support_user_id, deal_created_date
+                    )
+                    SELECT 
+                        id as deal_id,
+                        title,
+                        value,
+                        currency,
+                        stage_id,
+                        status,
+                        add_time as created_date,
+                        update_time as last_updated,
+                        stage_change_time,
+                        won_time,
+                        lost_time,
+                        close_time,
+                        active,
+                        COALESCE(EXTRACT(DAY FROM NOW() - add_time::timestamp), 0) as days_in_pipeline,
+                        CASE 
+                            WHEN won_time IS NOT NULL AND add_time IS NOT NULL 
+                            THEN EXTRACT(DAY FROM won_time - add_time::timestamp)
+                            ELSE NULL
+                        END as days_to_win,
+                        CASE 
+                            WHEN lost_time IS NOT NULL AND add_time IS NOT NULL 
+                            THEN EXTRACT(DAY FROM lost_time - add_time::timestamp)
+                            ELSE NULL
+                        END as days_to_lose,
+                        CASE 
+                            WHEN status = 'won' THEN 'Won'
+                            WHEN status = 'lost' THEN 'Lost' 
+                            ELSE 'Active'
+                        END as deal_status,
+                        org_id,
+                        CASE 
+                            WHEN org_id IS NOT NULL THEN 'Organization ' || org_id::text
+                            ELSE 'No Organization'
+                        END as org_name,
+                        pipeline_id,
+                        channel,
+                        label_id,
+                        user_id,
+                        partner_support_user_id,
+                        deal_created_date
+                    FROM pipedrive.fact_pipedrive_deals_raw
+                """))
+                
+                trans.commit()
+                
+                # Print comprehensive statistics
+                print(f"\n📊 COMPREHENSIVE DEALS ANALYSIS:")
+                print(f"   - Total deals processed: {total_deals:,}")
+                print(f"   - Inserted: {inserted:,}")
+                print(f"   - Updated: {updated:,}")
+                print(f"   - Won deals: {won_deals:,} ({won_deals/max(total_deals, 1)*100:.1f}%)")
+                print(f"   - Lost deals: {lost_deals:,} ({lost_deals/max(total_deals, 1)*100:.1f}%)")
+                print(f"   - Active deals: {total_deals - won_deals - lost_deals:,}")
+                print(f"   - Multiple labels: {multi_label_count:,}")
+                print(f"   - With user_id: {deals_with_user_id:,} ({deals_with_user_id/max(total_deals, 1)*100:.1f}%)")
+                print(f"   - Errors: {stats.errors:,}")
+                
+                # Get pipeline statistics with focus on STU/TTU pipelines
+                print(f"\n📈 PIPELINE ANALYSIS (Focus on STU/TTU):")
+                
+                all_pipelines = conn.execute(text("""
+                    SELECT 
+                        pipeline_id,
+                        COUNT(*) as deal_count,
+                        SUM(value) as total_value,
+                        SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END) as won_count,
+                        SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) as lost_count
+                    FROM pipedrive.fact_pipedrive_deals_raw
+                    GROUP BY pipeline_id
+                    ORDER BY total_value DESC
+                """)).fetchall()
+                
+                print(f"   - Total pipelines: {len(all_pipelines)}")
+                
+                # Focus on pipelines 5 and 37 (STU/TTU)
+                stu_ttu_pipelines = [p for p in all_pipelines if p[0] in (5, 37)]
+                if stu_ttu_pipelines:
+                    print(f"\n   🎯 STU/TTU PIPELINES (5 & 37):")
+                    for pipeline_id, deal_count, total_value, won_count, lost_count in stu_ttu_pipelines:
+                        pipeline_name = "Third Top Up (TTU)" if pipeline_id == 5 else "Partner Support Onboarding (STU)"
+                        win_rate = (won_count / deal_count * 100) if deal_count > 0 else 0
+                        print(f"      • {pipeline_name} (ID: {pipeline_id}):")
+                        print(f"        {deal_count:,} deals, £{total_value:,.2f}, {win_rate:.1f}% win rate")
+                        print(f"        Won: {won_count:,}, Lost: {lost_count:,}, Active: {deal_count - won_count - lost_count:,}")
+                
+                # Show top 5 other pipelines
+                other_pipelines = [p for p in all_pipelines if p[0] not in (5, 37)][:5]
+                if other_pipelines:
+                    print(f"\n   📊 TOP 5 OTHER PIPELINES:")
+                    for pipeline_id, deal_count, total_value, won_count, lost_count in other_pipelines:
+                        win_rate = (won_count / deal_count * 100) if deal_count > 0 else 0
+                        print(f"      • Pipeline {pipeline_id}: {deal_count:,} deals, £{total_value:,.2f}, {win_rate:.1f}% win rate")
+                
+                # Check for won_time availability
+                if won_deals > 0:
+                    won_time_count = conn.execute(text("""
+                        SELECT COUNT(*) 
+                        FROM pipedrive.fact_pipedrive_deals_raw 
+                        WHERE won_time IS NOT NULL AND status = 'won'
+                    """)).scalar()
+                    
+                    print(f"\n⏱️  WON TIME STATISTICS:")
+                    print(f"   - Deals with won_time: {won_time_count:,} of {won_deals:,} won deals ({won_time_count/max(won_deals, 1)*100:.1f}%)")
+                    
+                    if won_time_count > 0:
+                        avg_days_to_win_stu_ttu = conn.execute(text("""
+                            SELECT 
+                                pipeline_id,
+                                AVG(days_to_win) as avg_days_to_win
+                            FROM pipedrive.fact_pipedrive_deals_processed
+                            WHERE days_to_win IS NOT NULL 
+                                AND pipeline_id IN (5, 37)
+                            GROUP BY pipeline_id
+                        """)).fetchall()
+                        
+                        if avg_days_to_win_stu_ttu:
+                            print(f"   📅 AVERAGE DAYS TO WIN (STU/TTU):")
+                            for pipeline_id, avg_days in avg_days_to_win_stu_ttu:
+                                pipeline_name = "Third Top Up (TTU)" if pipeline_id == 5 else "Partner Support Onboarding (STU)"
+                                print(f"      • {pipeline_name}: {avg_days:.1f} days")
+                
+            except Exception as e:
+                trans.rollback()
+                stats.errors += 1
+                print(f"❌ Deals sync failed: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        return stats
+    
+    def execute_stu_ttu_procedure(self):
+        """Execute the STU/TTU partner deals stored procedure"""
+        print("\n🔄 RUNNING STORED PROCEDURE: pipedrive.sp_upsert_partner_stu_ttu_deals()")
+        print("-" * 60)
+        
+        try:
+            with self.engine.connect() as conn:
+                # Check if the stored procedure exists
+                result = conn.execute(text("""
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.routines
+                        WHERE routine_schema = 'pipedrive'
+                        AND routine_name = 'sp_upsert_partner_stu_ttu_deals'
+                    )
+                """))
+                
+                procedure_exists = result.scalar()
+                
+                if procedure_exists:
+                    print("✅ Stored procedure found. Executing...")
+                    
+                    # Execute the stored procedure
+                    conn.execute(text("CALL pipedrive.sp_upsert_partner_stu_ttu_deals()"))
+                    conn.commit()
+                    
+                    print("✅ Stored procedure executed successfully!")
+                    
+                    # Check the results - look for STU/TTU related tables
+                    print("\n📊 CHECKING STU/TTU DATA:")
+                    
+                    try:
+                        stu_ttu_exists = conn.execute(text("""
+                            SELECT EXISTS (
+                                SELECT 1
+                                FROM information_schema.tables
+                                WHERE table_schema = 'pipedrive'
+                                AND table_name = 'partner_stu_ttu_deals'
+                            )
+                        """)).scalar()
+                        
+                        if stu_ttu_exists:
+                            stu_ttu_count = conn.execute(text("""
+                                SELECT COUNT(*) 
+                                FROM pipedrive.partner_stu_ttu_deals
+                            """)).scalar()
+                            
+                            print(f"   - partner_stu_ttu_deals table: {stu_ttu_count:,} records")
+                            
+                            stu_ttu_stats = conn.execute(text("""
+                                SELECT 
+                                    pipeline_name,
+                                    COUNT(*) as deal_count,
+                                    SUM(value) as total_value,
+                                    SUM(CASE WHEN deal_status = 'Won' THEN 1 ELSE 0 END) as won_count
+                                FROM pipedrive.partner_stu_ttu_deals
+                                GROUP BY pipeline_name
+                                ORDER BY total_value DESC
+                            """)).fetchall()
+                            
+                            if stu_ttu_stats:
+                                print(f"\n   🎯 STU/TTU BREAKDOWN:")
+                                for pipeline_name, deal_count, total_value, won_count in stu_ttu_stats:
+                                    win_rate = (won_count / deal_count * 100) if deal_count > 0 else 0
+                                    print(f"      • {pipeline_name}: {deal_count:,} deals, £{total_value:,.2f}, {win_rate:.1f}% win rate")
+                        
+                        else:
+                            partner_tables = conn.execute(text("""
+                                SELECT table_name
+                                FROM information_schema.tables
+                                WHERE table_schema = 'pipedrive'
+                                AND table_name LIKE '%partner%deal%'
+                            """)).fetchall()
+                            
+                            if partner_tables:
+                                print(f"   - Found partner tables: {[t[0] for t in partner_tables]}")
+                                for table_name in [t[0] for t in partner_tables]:
+                                    try:
+                                        table_count = conn.execute(text(f"SELECT COUNT(*) FROM pipedrive.{table_name}")).scalar()
+                                        print(f"      • {table_name}: {table_count:,} records")
+                                    except:
+                                        pass
+                            else:
+                                print("   ⚠️  No partner deals tables found")
+                    
+                    except Exception as table_error:
+                        print(f"   ⚠️  Could not check STU/TTU tables: {table_error}")
+                        
+                else:
+                    print("⚠️  Stored procedure 'pipedrive.sp_upsert_partner_stu_ttu_deals()' not found.")
+                    print("\n💡 SUGGESTIONS:")
+                    print("   1. Check if the procedure exists with a different name")
+                    print("   2. Create the procedure in your database")
+                    print("   3. Run analysis directly on fact_pipedrive_deals_processed")
+                    
+                    # Provide direct STU/TTU analysis as alternative
+                    print(f"\n📊 DIRECT STU/TTU ANALYSIS (Alternative):")
+                    
+                    stu_ttu_direct = conn.execute(text("""
+                        SELECT 
+                            CASE 
+                                WHEN pipeline_id = 5 THEN 'Third Top Up (TTU)'
+                                WHEN pipeline_id = 37 THEN 'Partner Support Onboarding (STU)'
+                                ELSE 'Other'
+                            END as pipeline_type,
+                            deal_status,
+                            COUNT(*) as deal_count,
+                            SUM(value) as total_value,
+                            AVG(days_in_pipeline) as avg_days_active,
+                            AVG(days_to_win) as avg_days_to_win
+                        FROM pipedrive.fact_pipedrive_deals_processed
+                        WHERE pipeline_id IN (5, 37)
+                        GROUP BY pipeline_id, deal_status
+                        ORDER BY pipeline_id, deal_status
+                    """)).fetchall()
+                    
+                    if stu_ttu_direct:
+                        print(f"   - STU/TTU deals available in processed table")
+                        current_pipeline = None
+                        for pipeline_type, deal_status, deal_count, total_value, avg_days_active, avg_days_to_win in stu_ttu_direct:
+                            if pipeline_type != current_pipeline:
+                                print(f"\n   🎯 {pipeline_type}:")
+                                current_pipeline = pipeline_type
+                            print(f"      • {deal_status}: {deal_count:,} deals, £{total_value:,.2f}")
+                            if deal_status == 'Active':
+                                print(f"        Avg days active: {avg_days_active:.1f}")
+                            elif deal_status == 'Won' and avg_days_to_win:
+                                print(f"        Avg days to win: {avg_days_to_win:.1f}")
+        
+        except Exception as e:
+            print(f"❌ Error executing stored procedure: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        return True
+    
+    def run_master_partner_update(self):
+        """Execute the master partner update stored procedure (combines all CRM SPs)"""
+        print("\n🚀 RUNNING MASTER PARTNER UPDATE SP")
+        print("-" * 60)
+        
+        try:
+            with self.engine.connect() as conn:
+                # Execute the master SP with default 90 days
+                conn.execute(text("CALL crm_data.sp_master_partner_update()"))
+                conn.commit()
+                
+                print("✅ Master partner update completed successfully!")
+                
+                # Verify results
+                print("\n📊 VERIFYING MASTER PARTNER UPDATE:")
+                
+                # Check main cohort stats
+                main_stats = conn.execute(text("""
+                    SELECT 
+                        COUNT(*) as total,
+                        COUNT(CASE WHEN stu_flag THEN 1 END) as stu_count,
+                        COUNT(CASE WHEN ttu_flag THEN 1 END) as ttu_count,
+                        COUNT(CASE WHEN credit_status IS NOT NULL THEN 1 END) as with_credit,
+                        COUNT(CASE WHEN crm_company_id IS NULL THEN 1 END) as unmatched
+                    FROM crm_data.partner_cohort_master
+                    WHERE onboarding_source = 'pipedrive'
+                """)).fetchone()
+                
+                print(f"\n   📊 MAIN COHORT STATS:")
+                print(f"      • Total partners: {main_stats[0]}")
+                print(f"      • STU flagged: {main_stats[1]}")
+                print(f"      • TTU flagged: {main_stats[2]}")
+                print(f"      • With credit status: {main_stats[3]}")
+                print(f"      • Unmatched: {main_stats[4]}")
+                
+                # Check STU cohort stats
+                stu_stats = conn.execute(text("""
+                    SELECT 
+                        COUNT(*) as total,
+                        COUNT(partner_support_name) as with_support,
+                        COUNT(CASE WHEN ttu_flag THEN 1 END) as converted
+                    FROM crm_data.stu_cohort_master
+                    WHERE stu_date >= CURRENT_DATE - INTERVAL '90 days'
+                """)).fetchone()
+                
+                if stu_stats[0] > 0:
+                    print(f"\n   📊 STU COHORT (Last 90 days):")
+                    print(f"      • Total STUs: {stu_stats[0]}")
+                    print(f"      • With partner support: {stu_stats[1]}")
+                    print(f"      • Converted to TTU: {stu_stats[2]}")
+                
+                # Check missing CRM records
+                missing = conn.execute(text("""
+                    SELECT COUNT(*) 
+                    FROM crm_data.missing_crm_checking 
+                    WHERE status = 'pending'
+                """)).scalar()
+                
+                if missing > 0:
+                    print(f"\n   ⚠️  {missing} records pending CRM matching in missing_crm_checking")
+                
+                return True
+                
+        except Exception as e:
+            print(f"❌ Error executing master partner update: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+
+def main():
+    """Main execution function"""
+    print("🚀 STARTING COMPLETE PIPEDRIVE TO CRM PIPELINE")
+    print("=" * 70)
+    
+    # Initialize components
+    api_client = PipedriveAPIClient(PIPEDRIVE_BASE_URL, PIPEDRIVE_API_TOKEN)
+    db_manager = DatabaseManager(DB_CONFIG)
+    
+    try:
+        # Step 1: Ensure tables exist
+        print("\n📦 STEP 1: SETTING UP DATABASE TABLES")
+        print("-" * 40)
+        db_manager.ensure_tables_exist()
+        
+        # Step 2: Sync deals data from Pipedrive
+        print("\n🔄 STEP 2: SYNCING DEALS DATA FROM PIPEDRIVE")
+        print("-" * 40)
+        deals = api_client.fetch_all_paginated('deals')
+        
+        if not deals:
+            print("⚠️  No deals data fetched")
+            print("\n❌ Sync failed - no data available")
+            sys.exit(1)
+        
+        deals_stats = db_manager.sync_deals_only(deals)
+        deals_stats.print_summary("deals")
+        
+        # Step 3: Execute STU/TTU stored procedure (Pipedrive deals enrichment)
+        print("\n" + "=" * 70)
+        print("🔄 STEP 3: EXECUTING STU/TTU PARTNER DEALS SP")
+        print("-" * 40)
+        stu_ttu_success = db_manager.execute_stu_ttu_procedure()
+        
+        # Step 4: Execute Master Partner Update SP (CRM enrichment)
+        print("\n" + "=" * 70)
+        print("🔄 STEP 4: EXECUTING MASTER PARTNER UPDATE SP")
+        print("-" * 40)
+        master_success = db_manager.run_master_partner_update()
+        
+        # Final Summary
+        print("\n" + "=" * 70)
+        print("🎯 COMPLETE PIPELINE EXECUTION SUMMARY")
+        print("=" * 70)
+        
+        if deals_stats.errors == 0 and stu_ttu_success and master_success:
+            print("✅ ALL STEPS COMPLETED SUCCESSFULLY!")
+        else:
+            print("⚠️  Pipeline completed with some issues:")
+            if deals_stats.errors > 0:
+                print(f"   • Deals sync had {deals_stats.errors} errors")
+            if not stu_ttu_success:
+                print("   • STU/TTU procedure had issues")
+            if not master_success:
+                print("   • Master partner update had issues")
+        
+        print("\n📊 DATA NOW AVAILABLE IN:")
+        print("   • pipedrive.fact_pipedrive_deals_raw - Raw deal data")
+        print("   • pipedrive.fact_pipedrive_deals_processed - Analyzed deals")
+        print("   • pipedrive.fact_partner_stu_ttu_deals - STU/TTU partner deals")
+        print("   • crm_data.partner_cohort_master - Partner cohort master")
+        print("   • crm_data.stu_cohort_master - STU cohort master")
+        print("   • crm_data.missing_crm_checking - Unmatched partners")
+        
+        print("\n📋 NEXT STEPS:")
+        print("   1. Review unmatched partners in crm_data.missing_crm_checking")
+        print("   2. Monitor STU → TTU conversion rates")
+        print("   3. Check credit status distribution")
+        print("   4. Schedule this script for daily updates")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Process interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Critical error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    print("\n" + "=" * 70)
+    print("✅ PIPELINE EXECUTION COMPLETE")
+    print("=" * 70)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

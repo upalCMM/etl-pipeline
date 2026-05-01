@@ -1,0 +1,121 @@
+# BigQuery ETL Test Results - Fri Jan 23 17:02:10 GMT 2026
+========================================
+🔍 Script analysis:
+  📊 Type: Google Analytics 4
+  ⚠️  No test mode detected
+
+🚀 Executing ga4_landing_pages_update_final_schd.py ...
+Traceback (most recent call last):
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/ga4_landing_pages_update_final_schd.py", line 20, in <module>
+    from config import DB_CONFIG, BIGQUERY_CONFIG
+ImportError: cannot import name 'BIGQUERY_CONFIG' from 'config' (/home/upalcmm/scripts/etl_pipeline/config.py)
+
+📊 Execution summary:
+  Duration: 0s
+  Exit code: 1
+  Status: ❌ FAILED
+  Last 5 lines:
+Traceback (most recent call last):
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/ga4_landing_pages_update_final_schd.py", line 20, in <module>
+    from config import DB_CONFIG, BIGQUERY_CONFIG
+ImportError: cannot import name 'BIGQUERY_CONFIG' from 'config' (/home/upalcmm/scripts/etl_pipeline/config.py)
+========================================
+========================================
+🔍 Script analysis:
+  📊 Type: Google Analytics 4
+  ⚠️  No test mode detected
+
+🚀 Executing ga4_referrer_sessions_update_final_schd.py ...
+Traceback (most recent call last):
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/ga4_referrer_sessions_update_final_schd.py", line 22, in <module>
+    from config import DB_CONFIG, BIGQUERY_CONFIG
+ImportError: cannot import name 'BIGQUERY_CONFIG' from 'config' (/home/upalcmm/scripts/etl_pipeline/config.py)
+
+📊 Execution summary:
+  Duration: 1s
+  Exit code: 1
+  Status: ❌ FAILED
+  Last 5 lines:
+Traceback (most recent call last):
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/ga4_referrer_sessions_update_final_schd.py", line 22, in <module>
+    from config import DB_CONFIG, BIGQUERY_CONFIG
+ImportError: cannot import name 'BIGQUERY_CONFIG' from 'config' (/home/upalcmm/scripts/etl_pipeline/config.py)
+========================================
+========================================
+🔍 Script analysis:
+  🔍 Type: Google Search Console
+  ⚠️  No test mode detected
+
+🚀 Executing gsc_daily_update_final_schd.py ...
+Traceback (most recent call last):
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/gsc_daily_update_final_schd.py", line 20, in <module>
+    from config import DB_CONFIG, BIGQUERY_CONFIG
+ImportError: cannot import name 'BIGQUERY_CONFIG' from 'config' (/home/upalcmm/scripts/etl_pipeline/config.py)
+
+📊 Execution summary:
+  Duration: 1s
+  Exit code: 1
+  Status: ❌ FAILED
+  Last 5 lines:
+Traceback (most recent call last):
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/gsc_daily_update_final_schd.py", line 20, in <module>
+    from config import DB_CONFIG, BIGQUERY_CONFIG
+ImportError: cannot import name 'BIGQUERY_CONFIG' from 'config' (/home/upalcmm/scripts/etl_pipeline/config.py)
+========================================
+========================================
+🔍 Script analysis:
+  📢 Type: Google Ads
+  ⚠️  No test mode detected
+
+🚀 Executing update_google_ads_data_final_schd.py ...
+2026-01-23 17:02:12,579 - __main__ - INFO - Initializing BigQuery client...
+2026-01-23 17:02:12,580 - __main__ - INFO - ✅ BigQuery client connected
+2026-01-23 17:02:12,618 - __main__ - INFO - ✅ PostgreSQL engine created
+2026-01-23 17:02:12,618 - __main__ - INFO - ✅ ETL initialized with date range: 2025-01-01 to 2026-01-22
+2026-01-23 17:02:12,618 - __main__ - INFO - ⚠ IMPORTANT: Using FIXED query that includes ALL campaign statuses (ENABLED, PAUSED, REMOVED)
+2026-01-23 17:02:12,618 - __main__ - INFO - ================================================================================
+2026-01-23 17:02:12,619 - __main__ - INFO - ✅ GOOGLE ADS FIXED ETL (NO CAMPAIGN STATUS FILTER)
+2026-01-23 17:02:12,619 - __main__ - INFO - ================================================================================
+2026-01-23 17:02:12,619 - __main__ - INFO - 📅 Date range: 2025-01-01 to 2026-01-22
+2026-01-23 17:02:12,619 - __main__ - INFO - 🎯 Target: google_data.google_ads_daily
+2026-01-23 17:02:12,619 - __main__ - INFO - ================================================================================
+2026-01-23 17:02:12,619 - __main__ - INFO - Step 1: EXTRACT from BigQuery...
+2026-01-23 17:02:12,619 - __main__ - INFO - 📥 EXTRACT: Fetching Google Ads data from 2025-01-01 to 2026-01-22...
+2026-01-23 17:02:15,257 - __main__ - INFO - 🚀 BigQuery query executing...
+2026-01-23 17:02:20,871 - __main__ - ERROR - ❌ EXTRACT failed: Please install the 'db-dtypes' package to use this function.
+2026-01-23 17:02:20,871 - __main__ - ERROR - ❌ ETL failed: Please install the 'db-dtypes' package to use this function.
+Traceback (most recent call last):
+  File "/home/upalcmm/scripts/venv/lib/python3.12/site-packages/google/cloud/bigquery/_pandas_helpers.py", line 59, in <module>
+    import db_dtypes  # type: ignore
+    ^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'db_dtypes'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/update_google_ads_data_final_schd.py", line 475, in run_etl
+    df_raw = self.extract_from_bigquery()
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/upalcmm/scripts/etl_pipeline/bigquery/update_google_ads_data_final_schd.py", line 257, in extract_from_bigquery
+    df = query_job.to_dataframe()
+         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/upalcmm/scripts/venv/lib/python3.12/site-packages/google/cloud/bigquery/job/query.py", line 2160, in to_dataframe
+    return query_result.to_dataframe(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/upalcmm/scripts/venv/lib/python3.12/site-packages/google/cloud/bigquery/table.py", line 2597, in to_dataframe
+    _pandas_helpers.verify_pandas_imports()
+  File "/home/upalcmm/scripts/venv/lib/python3.12/site-packages/google/cloud/bigquery/_pandas_helpers.py", line 1117, in verify_pandas_imports
+    raise ValueError(_NO_DB_TYPES_ERROR) from db_dtypes_import_exception
+ValueError: Please install the 'db-dtypes' package to use this function.
+
+📊 Execution summary:
+  Duration: 8s
+  Exit code: 1
+  Status: ❌ FAILED
+  Last 5 lines:
+  File "/home/upalcmm/scripts/venv/lib/python3.12/site-packages/google/cloud/bigquery/table.py", line 2597, in to_dataframe
+    _pandas_helpers.verify_pandas_imports()
+  File "/home/upalcmm/scripts/venv/lib/python3.12/site-packages/google/cloud/bigquery/_pandas_helpers.py", line 1117, in verify_pandas_imports
+    raise ValueError(_NO_DB_TYPES_ERROR) from db_dtypes_import_exception
+ValueError: Please install the 'db-dtypes' package to use this function.
+========================================

@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Logs
+logs/
+*.log
+
+# Environment
+.env
+
+# OS
+.DS_Store
+
+# Secrets
+.env.backup
+service-account-key.json
+*.json
+
+# If needed (safer)
+.env*
+
+# Secrets
+*.json
+*credentials*
+*token*
+*.backup
+*backup*.py
+config.py
+
+# Environment files
+.env
+.env.*
+
+# Environment
+etl_env/
+venv/
+
+# Secrets
+*.json
+*.env
+.env.*
+*credentials*
+*token*
+*.backup
+
+# Backups
+cleaned_backups/
+
+# Python cache
+__pycache__/

@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+# ===== UNICODE FIX FOR WINDOWS =====
+import sys
+import io
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+# ==================================================
+
+import requests
+from sqlalchemy import create_engine, text
+import logging
+import urllib3
+import sys
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+from config import PIPEDRIVE_API_TOKEN, PIPEDRIVE_BASE_URL, DB_CONFIG
+
+# ===== CREDIT STATUS FIELD CONFIGURATION =====
+CREDIT_STATUS_FIELD_KEY = "17d0a73155c2ca4ecfde639a83c5f6a44aeca673"
+# =============================================
+
+def get_credit_status_mapping():
+    """Get the mapping of option IDs to labels for Credit Status field"""
+    print("🔍 Fetching Credit Status field options...")
+    
+    url = f"{PIPEDRIVE_BASE_URL}/dealFields?api_token={PIPEDRIVE_API_TOKEN}"
+    
+    try:
+        response = requests.get(url, verify=False, timeout=30)
+        data = response.json()
+        
+        if data.get('success'):
+            for field in data.get('data', []):
+                if field.get('key') == CREDIT_STATUS_FIELD_KEY:
+                    options = field.get('options', [])
+                    mapping = {opt['id']: opt['label'] for opt in options if 'id' in opt and 'label' in opt}
+                    print("✅ Credit Status options found:")
+                    for opt_id, label in mapping.items():
+                        print(f"   {opt_id} → '{label}'")
+                    return mapping
+        
+        print("❌ Could not fetch Credit Status options")
+        return {}
+        
+    except Exception as e:
+        print(f"❌ Error fetching options: {e}")
+        return {}
+
+def fetch_all_deals():
+    """Fetch ALL deals with timeline dates"""
+    all_deals = []
+    start = 0
+    limit = 500
+    
+    print("📅 Fetching deals...")
+    
+    while True:
+        url = f"{PIPEDRIVE_BASE_URL}/deals?api_token={PIPEDRIVE_API_TOKEN}&start={start}&limit={limit}&include_timeline_dates=1"
+        
+        try:
+            response = requests.get(url, verify=False, timeout=30)
+            data = response.json()
+            
+            if not data.get('success'):
+                break
+            
+            deals = data.get('data', [])
+            all_deals.extend(deals)
+            
+            print(f"📥 Batch {start//limit + 1}: {len(deals)} deals")
+            
+            pagination = data.get('additional_data', {}).get('pagination', {})
+            if not pagination.get('more_items_in_collection', False):
+                break
+                
+            start = pagination.get('next_start', 0)
+                
+        except Exception as e:
+            print(f"❌ Request failed: {e}")
+            break
+    
+    print(f"✅ Total deals: {len(all_deals)}")
+    return all_deals
+
+def extract_credit_status(deal, status_mapping):
+    """Extract and convert credit status from numeric ID to label"""
+    # Get raw value from different possible locations
+    raw_value = (
+        deal.get(CREDIT_STATUS_FIELD_KEY) or
+        deal.get('custom_fields', {}).get(CREDIT_STATUS_FIELD_KEY) or
+        deal.get('additional_data', {}).get('custom_fields', {}).get(CREDIT_STATUS_FIELD_KEY)
+    )
+    
+    # Convert to human-readable label
+    if raw_value is not None:
+        if isinstance(raw_value, int):
+            return status_mapping.get(raw_value)
+        elif isinstance(raw_value, str) and raw_value.isdigit():
+            return status_mapping.get(int(raw_value))
+        else:
+            return str(raw_value)
+    
+    return None
+
+def extract_label_ids(deal):
+    """Extract label IDs from deal data"""
+    label_data = deal.get('label')
+    
+    if not label_data:
+        return None
+    
+    if isinstance(label_data, list):
+        return [label['id'] for label in label_data if isinstance(label, dict) and 'id' in label]
+    
+    elif isinstance(label_data, dict) and 'id' in label_data:
+        return [label_data['id']]
+    
+    elif isinstance(label_data, (int, str)):
+        try:
+            if isinstance(label_data, str) and ',' in label_data:
+                return [int(lbl.strip()) for lbl in label_data.split(',')]
+            else:
+                return [int(label_data)]
+        except (ValueError, TypeError):
+            return None
+    
+    return None
+
+def extract_user_id(deal):
+    """Extract user_id from deal data"""
+    user_id = deal.get('user_id')
+    
+    if isinstance(user_id, dict):
+        return user_id.get('id') or user_id.get('value')
+    elif isinstance(user_id, (int, str)):
+        return int(user_id) if str(user_id).isdigit() else user_id
+    
+    owner_data = deal.get('owner')
+    if isinstance(owner_data, dict):
+        return owner_data.get('id')
+    
+    return None
+
+def ensure_credit_status_column(engine):
+    """Ensure credit_status column exists in both tables"""
+    print("🔍 Checking credit_status column...")
+    
+    with engine.connect() as conn:
+        try:
+            # Check raw table
+            result = conn.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = 'pipedrive' 
+                AND table_name = 'fact_pipedrive_deals_raw' 
+                AND column_name = 'credit_status'
+            """))
+            
+            if not result.fetchone():
+                conn.execute(text("ALTER TABLE pipedrive.fact_pipedrive_deals_raw ADD COLUMN credit_status VARCHAR(255)"))
+                print("✅ Added credit_status to raw table")
+            
+            # Check processed table
+            result = conn.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = 'pipedrive' 
+                AND table_name = 'fact_pipedrive_deals_processed' 
+                AND column_name = 'credit_status'
+            """))
+            
+            if not result.fetchone():
+                conn.execute(text("ALTER TABLE pipedrive.fact_pipedrive_deals_processed ADD COLUMN credit_status VARCHAR(255)"))
+                print("✅ Added credit_status to processed table")
+            
+            conn.commit()
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            conn.rollback()
+            return False
+
+def get_processed_table_columns(engine):
+    """Get the actual column names and order from the processed table"""
+    print("🔍 Checking processed table structure...")
+    
+    with engine.connect() as conn:
+        try:
+            result = conn.execute(text("""
+                SELECT column_name, data_type 
+                FROM information_schema.columns 
+                WHERE table_schema = 'pipedrive' 
+                AND table_name = 'fact_pipedrive_deals_processed'
+                ORDER BY ordinal_position
+            """))
+            
+            columns = [(row[0], row[1]) for row in result]
+            print("📋 Processed table columns:")
+            for name, dtype in columns:
+                print(f"   - {name} ({dtype})")
+            
+            return [col[0] for col in columns]
+            
+        except Exception as e:
+            print(f"❌ Error checking table structure: {e}")
+            return None
+
+def build_processed_insert_query(column_names):
+    """Build INSERT query that matches the exact column order of the processed table"""
+    
+    # Map raw table columns to processed table columns
+    column_mapping = {
+        'deal_id': 'id',
+        'title': 'title',
+        'value': 'value', 
+        'currency': 'currency',
+        'stage_id': 'stage_id',
+        'status': 'status',
+        'created_date': 'add_time',
+        'last_updated': 'update_time',
+        'stage_change_time': 'stage_change_time',
+        'active': 'active',
+        'days_in_pipeline': 'EXTRACT(DAY FROM NOW() - add_time::timestamp)',
+        'deal_status': "CASE WHEN status = 'won' THEN 'Won' WHEN status = 'lost' THEN 'Lost' ELSE 'Active' END",
+        'org_id': 'org_id',
+        'org_name': "CASE WHEN org_id IS NOT NULL THEN 'Organization ' || org_id::text ELSE 'No Organization' END",
+        'pipeline_id': 'pipeline_id',
+        'channel': 'channel',
+        'label_id': 'label_id',
+        'user_id': 'user_id',
+        'credit_status': 'credit_status'
+    }
+    
+    # Build SELECT clause matching the processed table column order
+    select_parts = []
+    for col in column_names:
+        if col in column_mapping:
+            if col in ['days_in_pipeline', 'deal_status', 'org_name']:
+                # These are calculated columns
+                select_parts.append(f"{column_mapping[col]} as {col}")
+            else:
+                # Direct column mappings
+                select_parts.append(f"{column_mapping[col]} as {col}")
+        else:
+            # For unknown columns, use NULL
+            select_parts.append(f"NULL as {col}")
+    
+    query = f"""
+        INSERT INTO pipedrive.fact_pipedrive_deals_processed ({', '.join(column_names)})
+        SELECT {', '.join(select_parts)}
+        FROM pipedrive.fact_pipedrive_deals_raw
+    """
+    
+    return query
+
+def sync_all_deals():
+    """Main sync function"""
+    print("🔄 SYNCING DEALS WITH CREDIT STATUS")
+    print("=" * 50)
+    
+    # Get credit status mapping
+    status_mapping = get_credit_status_mapping()
+    if not status_mapping:
+        print("❌ Cannot proceed without credit status mapping")
+        return False
+    
+    # Setup database
+    engine = create_engine(f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
+    
+    if not ensure_credit_status_column(engine):
+        return False
+    
+    # Get processed table structure
+    processed_columns = get_processed_table_columns(engine)
+    if not processed_columns:
+        print("❌ Cannot get processed table structure")
+        return False
+    
+    # Fetch deals
+    deals = fetch_all_deals()
+    if not deals:
+        return False
+    
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            print("💾 Upserting deals...")
+            
+            updated = 0
+            inserted = 0
+            credit_status_count = 0
+            status_distribution = {}
+            
+            for i, deal in enumerate(deals):
+                # Extract data
+                org_data = deal.get('org_id', {})
+                person_data = deal.get('person_id', {})
+                
+                org_id = org_data.get('value') or org_data.get('id') if isinstance(org_data, dict) else org_data
+                person_id = person_data.get('value') or person_data.get('id') if isinstance(person_data, dict) else person_data
+                
+                # Extract credit status (this now returns the human-readable label)
+                credit_status = extract_credit_status(deal, status_mapping)
+                if credit_status:
+                    credit_status_count += 1
+                    status_distribution[credit_status] = status_distribution.get(credit_status, 0) + 1
+                
+                # UPSERT
+                result = conn.execute(text("""
+                    UPDATE pipedrive.fact_pipedrive_deals_raw 
+                    SET title = :title, value = :value, currency = :currency, person_id = :person_id,
+                        org_id = :org_id, stage_id = :stage_id, status = :status, lost_reason = :lost_reason,
+                        visible_to = :visible_to, add_time = :add_time, update_time = :update_time,
+                        stage_change_time = :stage_change_time, active = :active, deleted = :deleted,
+                        probability = :probability, next_activity_date = :next_activity_date,
+                        next_activity_time = :next_activity_time, next_activity_id = :next_activity_id,
+                        last_activity_id = :last_activity_id, last_activity_date = :last_activity_date,
+                        lost_time = :lost_time, close_time = :close_time, pipeline_id = :pipeline_id,
+                        won_time = :won_time, first_won_time = :first_won_time,
+                        expected_close_date = :expected_close_date, channel = :channel, label_id = :label_id,
+                        user_id = :user_id, credit_status = :credit_status, sync_timestamp = NOW()
+                    WHERE id = :id
+                """), {
+                    'id': deal.get('id'),
+                    'title': deal.get('title', ''),
+                    'value': deal.get('value', 0),
+                    'currency': deal.get('currency', ''),
+                    'person_id': person_id,
+                    'org_id': org_id,
+                    'stage_id': deal.get('stage_id'),
+                    'status': deal.get('status', ''),
+                    'lost_reason': deal.get('lost_reason'),
+                    'visible_to': deal.get('visible_to'),
+                    'add_time': deal.get('add_time'),
+                    'update_time': deal.get('update_time'),
+                    'stage_change_time': deal.get('stage_change_time'),
+                    'active': deal.get('active', False),
+                    'deleted': deal.get('deleted', False),
+                    'probability': deal.get('probability'),
+                    'next_activity_date': deal.get('next_activity_date'),
+                    'next_activity_time': deal.get('next_activity_time'),
+                    'next_activity_id': deal.get('next_activity_id'),
+                    'last_activity_id': deal.get('last_activity_id'),
+                    'last_activity_date': deal.get('last_activity_date'),
+                    'lost_time': deal.get('lost_time'),
+                    'close_time': deal.get('close_time'),
+                    'pipeline_id': deal.get('pipeline_id'),
+                    'won_time': deal.get('won_time'),
+                    'first_won_time': deal.get('first_won_time'),
+                    'expected_close_date': deal.get('expected_close_date'),
+                    'channel': deal.get('channel'),
+                    'label_id': extract_label_ids(deal),
+                    'user_id': extract_user_id(deal),
+                    'credit_status': credit_status  # This is now the human-readable label
+                })
+                
+                if result.rowcount == 0:
+                    conn.execute(text("""
+                        INSERT INTO pipedrive.fact_pipedrive_deals_raw 
+                        (id, title, value, currency, person_id, org_id, stage_id, status, lost_reason,
+                         visible_to, add_time, update_time, stage_change_time, active, deleted, probability,
+                         next_activity_date, next_activity_time, next_activity_id, last_activity_id,
+                         last_activity_date, lost_time, close_time, pipeline_id, won_time, first_won_time,
+                         expected_close_date, channel, label_id, user_id, credit_status, sync_timestamp)
+                        VALUES 
+                        (:id, :title, :value, :currency, :person_id, :org_id, :stage_id, :status, :lost_reason,
+                         :visible_to, :add_time, :update_time, :stage_change_time, :active, :deleted, :probability,
+                         :next_activity_date, :next_activity_time, :next_activity_id, :last_activity_id,
+                         :last_activity_date, :lost_time, :close_time, :pipeline_id, :won_time, :first_won_time,
+                         :expected_close_date, :channel, :label_id, :user_id, :credit_status, NOW())
+                    """), {
+                        'id': deal.get('id'),
+                        'title': deal.get('title', ''),
+                        'value': deal.get('value', 0),
+                        'currency': deal.get('currency', ''),
+                        'person_id': person_id,
+                        'org_id': org_id,
+                        'stage_id': deal.get('stage_id'),
+                        'status': deal.get('status', ''),
+                        'lost_reason': deal.get('lost_reason'),
+                        'visible_to': deal.get('visible_to'),
+                        'add_time': deal.get('add_time'),
+                        'update_time': deal.get('update_time'),
+                        'stage_change_time': deal.get('stage_change_time'),
+                        'active': deal.get('active', False),
+                        'deleted': deal.get('deleted', False),
+                        'probability': deal.get('probability'),
+                        'next_activity_date': deal.get('next_activity_date'),
+                        'next_activity_time': deal.get('next_activity_time'),
+                        'next_activity_id': deal.get('next_activity_id'),
+                        'last_activity_id': deal.get('last_activity_id'),
+                        'last_activity_date': deal.get('last_activity_date'),
+                        'lost_time': deal.get('lost_time'),
+                        'close_time': deal.get('close_time'),
+                        'pipeline_id': deal.get('pipeline_id'),
+                        'won_time': deal.get('won_time'),
+                        'first_won_time': deal.get('first_won_time'),
+                        'expected_close_date': deal.get('expected_close_date'),
+                        'channel': deal.get('channel'),
+                        'label_id': extract_label_ids(deal),
+                        'user_id': extract_user_id(deal),
+                        'credit_status': credit_status  # This is now the human-readable label
+                    })
+                    inserted += 1
+                else:
+                    updated += 1
+                
+                if (i + 1) % 100 == 0:
+                    print(f"   Processed: {i + 1}/{len(deals)}")
+            
+            print(f"✅ Updated: {updated}, Inserted: {inserted}")
+            print(f"📊 Credit status found: {credit_status_count} deals")
+            
+            if status_distribution:
+                print("📈 Credit Status Distribution:")
+                for status, count in status_distribution.items():
+                    print(f"   - '{status}': {count} deals")
+            
+            # Rebuild processed table with correct column order
+            print("🔄 Updating processed table...")
+            conn.execute(text("TRUNCATE TABLE pipedrive.fact_pipedrive_deals_processed"))
+            
+            insert_query = build_processed_insert_query(processed_columns)
+            conn.execute(text(insert_query))
+            
+            trans.commit()
+            print("🎉 SYNC COMPLETED")
+            
+            return True
+            
+        except Exception as e:
+            trans.rollback()
+            print(f"❌ Sync failed: {e}")
+            return False
+
+if __name__ == "__main__":
+    success = sync_all_deals()
+    sys.exit(0 if success else 1)

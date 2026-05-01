@@ -1,0 +1,25 @@
+# Database connectors
+psycopg2-binary==2.9.9
+mysql-connector-python==8.2.0
+sqlalchemy==2.0.23
+
+# Data processing
+pandas==2.1.4
+numpy==1.24.3
+
+# Google Cloud services
+google-cloud-bigquery==3.12.0
+google-cloud-storage==2.13.0
+google-auth==2.25.2
+google-api-python-client==2.108.0
+
+# APIs and web
+requests==2.31.0
+pytz==2023.3.post1
+python-dotenv==1.0.0
+
+# Date/time
+python-dateutil==2.8.2
+
+# Utilities
+tqdm==4.66.1
