@@ -1,3 +1,4 @@
+# TEST CHANGE - Git branch learning
 #!/bin/bash
 # COMPLETE ETL MASTER SCHEDULER
 # Runs ALL 19 ETL scripts sequentially at 6:00 AM daily
