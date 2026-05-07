@@ -1,4 +1,3 @@
-# TEST CHANGE - Git branch learning
 #!/bin/bash
 # COMPLETE ETL MASTER SCHEDULER
 # Runs ALL 19 ETL scripts sequentially at 6:00 AM daily
@@ -98,6 +97,7 @@ PIPEDRIVE_SCRIPTS=(
     "sync_mailchimp_final.py"
     "sync_pipedrive_pipelines_final.py"
     "sync_pipedrive_deals_final.py"
+    "update_pipedrive_start_date.py"
 )
 
 for script in "${PIPEDRIVE_SCRIPTS[@]}"; do

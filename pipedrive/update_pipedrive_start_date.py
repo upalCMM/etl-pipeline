@@ -273,20 +273,22 @@ def update_non_outbound():
 def export_remaining_nulls():
 
     sql = """
-        SELECT
-            deal_id,
-            deal_title,
-            pipeline_name,
-            channel_name,
-            deal_status
-        FROM pipedrive.fact_partner_stu_ttu_deals
-        WHERE sales_created_date IS NULL
-          AND pipeline_name IN (
-                'NEW SALES PIPELINE',
-                'ONBOARDING - SALES'
-          )
-        ORDER BY deal_id
-    """
+    SELECT
+        deal_id,
+        deal_title,
+        pipeline_name,
+        channel_name,
+        deal_status
+    FROM pipedrive.fact_partner_stu_ttu_deals
+    WHERE sales_created_date IS NULL
+      AND channel_name = 'Outbound Data Scrape'
+      AND pipeline_name IN (
+            'NEW SALES PIPELINE',
+            'ONBOARDING - SALES'
+      )
+      AND deal_status IN ('Won','Active')
+    ORDER BY deal_id
+  """
 
     conn = get_conn()
 
@@ -294,9 +296,21 @@ def export_remaining_nulls():
 
     conn.close()
 
+    # =====================================================
+    # CREATE REPORTS DIRECTORY
+    # =====================================================
+
+    reports_dir = "reports"
+
+    os.makedirs(reports_dir, exist_ok=True)
+
+    # =====================================================
+    # CLEAN READABLE FILENAME
+    # =====================================================
+
     filename = (
-        "remaining_null_sales_created_date_"
-        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        f"{reports_dir}/"
+        "pipedrive_remaining_null_sales_created_date_report.csv"
     )
 
     df.to_csv(filename, index=False)
