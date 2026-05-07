@@ -50,3 +50,17 @@ cleaned_backups/
 
 # Python cache
 __pycache__/
+
+# backups
+*.backup*
+*.bak
+*~
+*.backup.*
+*.backup2
+
+# credentials / secrets
+*.json
+*.env
+*.pem
+reports/
+*.csv
