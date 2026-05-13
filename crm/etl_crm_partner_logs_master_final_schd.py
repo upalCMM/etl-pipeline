@@ -7,6 +7,8 @@ Fixes:
   (so VALUES tuples stay at 16 fields and the INSERT has 17 columns).
 - Uses server-side cursor for MariaDB to avoid loading 1.1M+ rows in memory.
 - Streams + upserts in batches.
+- FIXED: All UNION queries now use NULL AS for service_id/previous_id since 
+  none of the source tables have these columns.
 
 Requirements:
 - mysql-connector-python
@@ -66,10 +68,22 @@ if missing_pg:
 
 # MariaDB
 MARIA_HOST = os.getenv("MARIA_HOST")
-MARIA_PORT = int(os.getenv("MARIA_PORT"))
+MARIA_PORT = int(os.getenv("MARIA_PORT", "3306"))
 MARIA_USER = os.getenv("MARIA_USER")
 MARIA_PASS = os.getenv("MARIA_PASS")
 MARIA_DB   = os.getenv("MARIA_DB")
+
+# Validate MariaDB config
+missing_maria = [k for k, v in {
+    "MARIA_HOST": MARIA_HOST,
+    "MARIA_USER": MARIA_USER,
+    "MARIA_PASS": MARIA_PASS,
+    "MARIA_DB": MARIA_DB,
+}.items() if not v]
+
+if missing_maria:
+    print(f"[WARNING] Missing optional MariaDB env vars: {', '.join(missing_maria)}")
+    print("Will attempt to connect anyway...")
 
 
 # ---------------------------
@@ -94,6 +108,8 @@ def to_bool(val):
     return bool(val)
 
 
+# FIXED: All 4 queries now use NULL AS for service_id and previous_id
+# since none of the source tables have these columns
 UNION_SQL = """
 SELECT
     'Conveyancing' AS partner_type,
@@ -173,8 +189,8 @@ SELECT
     created_at,
     obfuscated_at,
     human,
-    service_id,
-    previous_id
+    NULL AS service_id,     -- FIXED: Changed from 'service_id' to NULL AS service_id
+    NULL AS previous_id     -- FIXED: Changed from 'previous_id' to NULL AS previous_id
 FROM compmove_core.company_logs
 """
 
@@ -265,7 +281,7 @@ def main():
         # ---------------------------
         print(f"\n[2/4] Executing UNION ALL query (streaming)...")
         maria_cursor.execute(UNION_SQL)
-        print("✅ Query started")
+        print("✅ Query started - streaming results")
 
         # ---------------------------
         # Connect to PostgreSQL
@@ -286,6 +302,7 @@ def main():
         # Stream + upsert in batches
         # ---------------------------
         print(f"\n[4/4] Streaming rows and upserting...")
+        print(f"Batch size: {FETCH_BATCH_SIZE:,} | Commit every: {COMMIT_EVERY:,} rows")
 
         total_processed = 0
         total_upserted = 0
@@ -313,8 +330,8 @@ def main():
                         r.get("created_at"),
                         r.get("obfuscated_at"),
                         to_bool(r.get("human")),
-                        r.get("service_id"),
-                        r.get("previous_id"),
+                        r.get("service_id"),   # Will always be NULL from all sources
+                        r.get("previous_id"),  # Will always be NULL from all sources
                     ))
                 except Exception as e:
                     # Skip bad rows but continue
@@ -341,12 +358,12 @@ def main():
 
         # Final commit
         pg_conn.commit()
-        print(f"✅ Final commit. Total processed={total_processed:,} Total upserted={total_upserted:,}")
+        print(f"\n✅ Final commit. Total processed={total_processed:,} Total upserted={total_upserted:,}")
 
         # Final count
         pg_cursor.execute("SELECT COUNT(*) FROM crm_data.partner_company_logs")
         total = pg_cursor.fetchone()[0]
-        print(f"📊 Total rows in table: {total:,}")
+        print(f"📊 Total rows in PostgreSQL table: {total:,}")
 
         # Summary
         end_time = datetime.now()
@@ -355,16 +372,20 @@ def main():
         print(f"\n{'='*60}")
         print("✅ ETL COMPLETED SUCCESSFULLY")
         print(f"{'='*60}")
-        print(f"Start: {start_time.strftime('%H:%M:%S')}")
-        print(f"End:   {end_time.strftime('%H:%M:%S')}")
-        print(f"Duration: {duration}")
-        print(f"Rows upserted: {total_upserted:,}")
+        print(f"Start:     {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"End:       {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Duration:  {duration}")
+        print(f"Processed: {total_processed:,} rows")
+        print(f"Upserted:  {total_upserted:,} rows")
+        print(f"Table total: {total:,} rows")
         print(f"{'='*60}")
 
         return True
 
     except mysql.connector.Error as e:
         print(f"\n❌ MariaDB Error: {e}")
+        print(f"Error code: {e.errno}")
+        print(f"SQL State: {e.sqlstate}")
         if pg_conn:
             pg_conn.rollback()
         return False
@@ -375,24 +396,29 @@ def main():
         return False
     except Exception as e:
         print(f"\n❌ Unexpected Error: {e}")
+        import traceback
+        traceback.print_exc()
         if pg_conn:
             pg_conn.rollback()
         return False
     finally:
+        print("\n[Cleanup] Closing connections...")
         try:
             if pg_cursor:
                 pg_cursor.close()
             if pg_conn:
                 pg_conn.close()
-        except Exception:
-            pass
+                print("✅ PostgreSQL connection closed")
+        except Exception as e:
+            print(f"⚠️ Error closing PostgreSQL: {e}")
         try:
             if maria_cursor:
                 maria_cursor.close()
             if maria_conn:
                 maria_conn.close()
-        except Exception:
-            pass
+                print("✅ MariaDB connection closed")
+        except Exception as e:
+            print(f"⚠️ Error closing MariaDB: {e}")
 
 
 if __name__ == "__main__":
@@ -404,4 +430,6 @@ if __name__ == "__main__":
         raise SystemExit(2)
     except Exception as e:
         print(f"\n💥 Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
         raise SystemExit(1)
